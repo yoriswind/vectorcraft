@@ -318,17 +318,15 @@ fn set_handle(s: &mut Session, p: &Value) -> Result<Value> {
         None => None,
         Some(v) => Some(finite_numbers(v).map(|[x, y]| Point::new(x, y)).ok_or_else(|| bad("path.setHandle", "`at` must be [x, y]"))?),
     };
-    // Compare the final anchor after translation and handle placement: repeating the same edit
-    // changes nothing and records no undo step.
-    if let Some(a) = anchor_of(s, id, si, ai)? {
-        let mut b = a;
-        if let Some(to) = at {
-            b.translate(to - b.p);
-        }
-        b.set_handle(out, pos, independent);
-        if b == a {
-            return ok();
-        }
+    // A handle already there, on an anchor already of the kind it would get, changes nothing and
+    // records no undo step. The handle is compared directly: `set_handle` would recompute the
+    // other handle of a smooth anchor, which need not give back the same value.
+    if let Some(a) = anchor_of(s, id, si, ai)?
+        && at.is_none_or(|to| to == a.p)
+        && (if out { a.h_out } else { a.h_in }) == pos
+        && !(independent && a.kind != AnchorKind::Corner)
+    {
+        return ok();
     }
     s.edit("Reshape", |d, _| {
         let path = path_mut(d, id)?;
