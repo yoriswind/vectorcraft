@@ -197,12 +197,18 @@ fn automatic_align_step_speed_and_stop_continue_share_the_compiled_choice() {
     actions::playback_drawn(&mut app);
     actions::tick_playback(&mut app, 1.0);
     assert!(actions::waiting_at_stop(&app));
+    // B must differ from the artboard center so a stale artboard reference fails this check.
+    app.run("select.set", json!({"ids": [recording.b.0]})).unwrap();
+    app.run("object.move", json!({"dx": 0, "dy": 40})).unwrap();
     app.run("select.set", json!({"ids": [recording.a.0, recording.b.0]})).unwrap();
     app.run("select.key", json!({"id": recording.b.0})).unwrap();
     app.run(actions::CONTINUE_PLAYBACK, json!({})).unwrap();
     assert!(app.ui.action_playing.is_none());
-    assert!(close(bounds(&app, recording.a), [180.0, 140.0, 220.0, 160.0]), "continued vertical Center resolves the current B key");
-    assert!(close(bounds(&app, recording.b), [180.0, 120.0, 260.0, 180.0]));
+    assert!(
+        close(bounds(&app, recording.a), [180.0, 180.0, 220.0, 200.0]),
+        "continued vertical Center resolves B at y=190, not the artboard at y=150"
+    );
+    assert!(close(bounds(&app, recording.b), [180.0, 160.0, 260.0, 220.0]), "the current key stays stationary during Continue");
     assert_eq!(raw_steps(&app), raw);
 }
 
