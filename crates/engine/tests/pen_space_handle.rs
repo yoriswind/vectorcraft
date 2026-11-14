@@ -310,3 +310,95 @@ fn pen_space_set_handle_at_keeps_corner_and_unrelated_fractional_geometry() {
     assert_eq!(s.doc().unwrap().doc.node(id).unwrap(), &node, "an invalid owner point does not apply the handle change first");
     assert_eq!(history(&s), before_bad);
 }
+fn noncollinear_smooth_path() -> (Session, NodeId) {
+    let (mut s, id) = open_pen_path();
+    // Native files may retain a Smooth kind whose two stored handles are not collinear.
+    let data = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc).node_mut(id).unwrap().path_data_mut().unwrap();
+    data.subpaths[0].anchors[1].h_in = Point::new(200.0, 350.0);
+    assert_eq!(data.subpaths[0].anchors[1].kind, AnchorKind::Smooth);
+    (s, id)
+}
+
+fn assert_noncollinear_space_translation(out: bool) {
+    let (mut s, id) = noncollinear_smooth_path();
+    let original = path(&s, id);
+    let a = original.subpaths[0].anchors[1];
+    let selected = if out { a.h_out } else { a.h_in };
+    let delta = vectorcraft_geom::Vec2::new(10.0, 0.0);
+    let target = selected + delta;
+    let before = history(&s);
+    pointer(&mut s, PointerKind::Down, (selected.x, selected.y), command(false));
+    pointer(&mut s, PointerKind::Drag, (target.x, target.y), command(true));
+    let moved = path(&s, id).subpaths[0].anchors[1];
+    assert_eq!(moved.kind, a.kind);
+    assert_eq!((moved.p, moved.h_in, moved.h_out), (a.p + delta, a.h_in + delta, a.h_out + delta), "Space preserves the loaded handle geometry");
+    pointer(&mut s, PointerKind::Drag, (target.x, target.y), command(false));
+    pointer(&mut s, PointerKind::Up, (target.x, target.y), command(false));
+    let changed = path(&s, id);
+    assert_eq!(changed.subpaths[0].anchors[1], moved, "releasing Space at the same point does not reshape the anchor");
+    assert_eq!(changed.subpaths[0].anchors[0], original.subpaths[0].anchors[0]);
+    assert_eq!(s.tool_id(), "pen");
+    assert_eq!(history(&s), before + 1);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(path(&s, id), original);
+}
+
+#[test]
+fn pen_space_noncollinear_smooth_outgoing_handle_is_pure_translation() {
+    assert_noncollinear_space_translation(true);
+}
+
+#[test]
+fn pen_space_noncollinear_smooth_incoming_handle_is_pure_translation() {
+    assert_noncollinear_space_translation(false);
+}
+
+#[test]
+fn pen_space_noncollinear_existing_noop_and_independent_corner_controls() {
+    let (mut s, id) = noncollinear_smooth_path();
+    let original = path(&s, id);
+    let a = original.subpaths[0].anchors[1];
+    let before = history(&s);
+    for (which, h) in [("in", a.h_in), ("out", a.h_out)] {
+        s.execute("path.setHandle", &json!({"id":id.0,"anchor":1,"which":which,"x":h.x,"y":h.y})).unwrap();
+        assert_eq!(path(&s, id), original);
+        assert_eq!(history(&s), before);
+    }
+    let delta = vectorcraft_geom::Vec2::new(10.0, 0.0);
+    let to = a.p + delta;
+    let h = a.h_out + delta;
+    s.execute("path.setHandle", &json!({"id":id.0,"anchor":1,"which":"out","at":[to.x,to.y],"x":h.x,"y":h.y,"independent":true})).unwrap();
+    let moved = path(&s, id).subpaths[0].anchors[1];
+    assert_eq!((moved.kind, moved.p, moved.h_in, moved.h_out), (AnchorKind::Corner, to, a.h_in + delta, h));
+    assert_eq!(history(&s), before + 1, "an explicit independent edit still converts Smooth to Corner");
+}
+
+#[test]
+fn pen_space_noncollinear_decimal_translation_keeps_shape_and_real_edits_work() {
+    let (mut s, id) = noncollinear_smooth_path();
+    let a = Anchor { p: Point::new(0.2, 0.2), h_in: Point::new(50.0, 100.0), h_out: Point::new(0.1, 25.2), kind: AnchorKind::Smooth };
+    std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc).node_mut(id).unwrap().path_data_mut().unwrap().subpaths[0].anchors[1] = a;
+    let original = path(&s, id);
+    let before = history(&s);
+    let delta = vectorcraft_geom::Vec2::new(0.1, 0.0);
+    let to = a.p + delta;
+    let handle = a.h_out + delta;
+    s.execute("path.setHandle", &json!({"id": id.0, "anchor": 1, "which": "out", "at": [to.x, to.y], "x": handle.x, "y": handle.y})).unwrap();
+    let moved = path(&s, id).subpaths[0].anchors[1];
+    assert_eq!(
+        (moved.kind, moved.p, moved.h_in, moved.h_out),
+        (a.kind, to, a.h_in + delta, handle),
+        "a decimal owner translation keeps the loaded shape and places the selected handle exactly"
+    );
+    assert_eq!(history(&s), before + 1);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(path(&s, id), original);
+    // Moving the handle relative to its translated owner is still a Smooth handle edit.
+    let edited = handle + vectorcraft_geom::Vec2::new(3.0, 1.0);
+    s.execute("path.setHandle", &json!({"id": id.0, "anchor": 1, "which": "out", "at": [to.x, to.y], "x": edited.x, "y": edited.y})).unwrap();
+    let moved = path(&s, id).subpaths[0].anchors[1];
+    assert_eq!((moved.kind, moved.p, moved.h_out), (AnchorKind::Smooth, to, edited));
+    let incoming = moved.h_in - moved.p;
+    let outgoing = moved.h_out - moved.p;
+    assert!(incoming.cross(outgoing).abs() < 1e-9 && incoming.dot(outgoing) < 0.0, "a real handle edit still aligns the opposite Smooth handle");
+}
