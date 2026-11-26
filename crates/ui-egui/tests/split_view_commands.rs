@@ -9,7 +9,8 @@ use vectorcraft_engine::Session;
 use vectorcraft_geom::Point;
 use vectorcraft_render::proof::{self, ProofView};
 use vectorcraft_ui_egui::VectorcraftApp;
-use vectorcraft_ui_egui::menus::{self, Item};
+use vectorcraft_ui_egui::menus;
+use craft::menu::Node;
 use vectorcraft_ui_egui::state::{SplitMode, SplitOrientation, SplitView, View};
 
 static GLOBALS: Mutex<()> = Mutex::new(());
@@ -94,14 +95,14 @@ fn split_view_commands_are_discoverable_checked_and_leave_art_and_main_modes_unc
     let split = view
         .iter()
         .find_map(|item| match item {
-            Item::Sub("Split View", children) => Some(children),
+            Node::Submenu { label, children, .. } if label=="Split View" => Some(children),
             _ => None,
         })
         .unwrap();
     let ids: Vec<_> = split
         .iter()
         .filter_map(|item| match item {
-            Item::Cmd(_, id, _) => Some(*id),
+            Node::Item(item) => Some(item.command.id.as_str()),
             _ => None,
         })
         .collect();

@@ -1,37 +1,168 @@
-//! Two interactive views through one camera, separated by a screen-space wipe.
-
-use super::{Drag, Pos2, Tokens, Ui, VectorcraftApp, Xf, drag, vec2};
-use crate::state::{SplitMode, SplitOrientation, SplitView};
+//! Two render modes on one native canvas and one tool host.
+use craft::behavior::{Axis, CancelReason, CanvasView, Metrics, PartKey, PointerEvent, PressPhase, Sense};
+use craft::ui::canvas::{CanvasSpace, RasterDisplay, AppPaint};
+use craft::ui::primitives::ContentPainterCx;
+use craft::behavior::PixelSize;
+use craft::ui::contract::{Access, Bind, BindMut, Common, Component, Cx, Edit as _, EditResponse, PaintUi, PartsCx, Pointer as _, Props, Role, Show as _};
+use craft::ui::docking::{divider, Splitter};
+use craft::ui::runtime::{env::Env, pointer};
+use craft::ui::style::{ComponentStyle, StyleCx};
+use egui::{Pos2, Ui};
 use vectorcraft_engine::ViewInfo;
+use crate::{VectorcraftApp, doc_windows::{self, Win}, state::{SplitMode, SplitOrientation, SplitView}};
+use super::raster;
 
+const EDGE: PartKey = PartKey::new("comparison-divider");
 #[derive(Clone, Copy)]
-struct DividerDrag {
-    doc: u64,
-    view: u32,
+struct Motion { axis: f32, moved: bool }
+#[derive(Clone, Copy)]
+struct HeldMode { win: Win, doc:u64, outline: bool, pixel: bool, active:bool }
+fn held_id() -> egui::Id { egui::Id::unique("split-held-mode") }
+
+pub(super) fn enabled(app: &VectorcraftApp) -> bool {
+    app.ui.screen_mode < 3 && !crate::menus::home_showing(app) && app.view().is_some_and(|v| v.split.enabled) && app.session.active().is_some()
+}
+pub(super) fn suspend(app: &mut VectorcraftApp, ctx: &egui::Context) {
+    if craft::ui::runtime::measure::active(ctx) {return;}
+    if !enabled(app) { app.canvas.split.clear(); }
+}
+
+pub(super) fn clips(rect: egui::Rect, split: SplitView) -> [egui::Rect; 2] {
+    let (mut a, mut b) = (rect, rect);
+    match split.orientation {
+        SplitOrientation::Vertical => { let x = rect.left() + rect.width() * split.ratio(); a.max.x=x; b.min.x=x; }
+        SplitOrientation::Horizontal => { let y = rect.top() + rect.height() * split.ratio(); a.max.y=y; b.min.y=y; }
+    }
+    [a,b]
+}
+fn axis(orientation: SplitOrientation) -> Axis { if orientation == SplitOrientation::Vertical { Axis::X } else { Axis::Y } }
+fn coord(orientation: SplitOrientation, p: Pos2) -> f32 { if orientation == SplitOrientation::Vertical { p.x } else { p.y } }
+
+#[derive(Clone, Debug, PartialEq, ComponentStyle)]
+struct DividerStyle { #[style(metrics)] metrics: Metrics }
+#[derive(Component, Props)]
+#[component(canvas_control)]
+struct ComparisonDivider<'a> {
+    #[common] common: Common,
+    fraction: Bind<'a, f32>,
     orientation: SplitOrientation,
-    start: f32,
-    motion: DividerMotion,
+    admit: bool,
 }
-
-#[derive(Clone, Copy)]
-struct DividerMotion {
-    axis: f32,
-    moved: bool,
-}
-
-impl DividerMotion {
-    fn new(orientation: SplitOrientation, p: Pos2) -> Self {
-        Self { axis: divider_axis(orientation, p), moved: false }
+impl ComparisonDivider<'_> {
+    fn line(&self, rect: egui::Rect, fraction: f32, rtl:bool) -> divider::Divider {
+        let (lo,hi) = if self.orientation == SplitOrientation::Vertical { (rect.left(),rect.right()) } else { (rect.top(),rect.bottom()) };
+        divider::Divider::new(axis(self.orientation), if rtl && self.orientation==SplitOrientation::Vertical {hi-(hi-lo)*fraction} else {lo+(hi-lo)*fraction}, rect, (lo,hi), 6.0)
+    }
+    fn ratio(&self, rect: egui::Rect, at: f32, rtl:bool) -> f32 {
+        let (lo,extent) = if self.orientation == SplitOrientation::Vertical { (rect.left(),rect.width()) } else { (rect.top(),rect.height()) };
+        let ratio=((at-lo)/extent.max(1.0)).clamp(0.0,1.0);
+        if rtl && self.orientation==SplitOrientation::Vertical {1.0-ratio} else {ratio}
     }
 }
-
-#[derive(Clone, Copy)]
-struct HeldMode {
-    doc: u64,
-    outline: bool,
-    pixel: bool,
+impl Component for ComparisonDivider<'_> {
+    const ROLE: Role = Role::GROUP;
+    const KEYS: craft::ui::runtime::focus::KeyUse = craft::ui::runtime::focus::KeyUse::SPLITTER;
+    type Style = DividerStyle;
+    type Output = EditResponse<f32>;
+    fn style(_: &StyleCx<'_>, _: ComparisonDividerStyleKey) -> DividerStyle { DividerStyle { metrics: Metrics::new() } }
+    fn sense(&self) -> Sense { Sense::empty() }
+    fn bind(&mut self) -> Option<BindMut<'_, f32>> { Some(self.fraction.reborrow()) }
+    fn parts(&mut self, rect: egui::Rect, cx: &mut PartsCx<'_, Self>) {
+        let line = self.line(rect, cx.value().copied().unwrap_or(0.5),cx.flow.is_rtl());
+        let part=divider::declare(cx, rect, EDGE, 0, &line);
+        if !self.admit {part.sense(Sense::HOVER);}
+    }
+    fn update(&mut self, cx: &mut Cx<'_, Self>) {
+        let phase = cx.part(EDGE.at(0)).press.phase;
+        let id = cx.id.with("axis-motion");
+        if let PressPhase::Down { start, .. } = phase {
+            cx.ctx.data_mut(|d| d.insert_temp(id, Motion { axis: coord(self.orientation,start.origin), moved:false }));
+            cx.begin();
+        }
+        if let Some(mut motion) = cx.ctx.data(|d| d.get_temp::<Motion>(id)) {
+            // H0 admits the Down last. Its earlier hover samples are not this owner's motion.
+            if !matches!(phase, PressPhase::Down { .. }) {
+                motion.moved |= pointer::with_pass_pointer(&cx.ctx, |pass| pass.events.iter().take_while(|e| !matches!(e, PointerEvent::Pressed { .. })).any(|e| {
+                    matches!(e, PointerEvent::Moved { at, .. } if coord(self.orientation,*at) != motion.axis)
+                }));
+                let at = match phase {
+                    PressPhase::DragStart { pos, .. } | PressPhase::Drag { pos, .. } | PressPhase::Release { pos, .. } => Some(pos),
+                    PressPhase::Held { .. } => pointer::frame(&cx.ctx).pos,
+                    _ => None,
+                };
+                motion.moved |= at.is_some_and(|at|coord(self.orientation,at)!=motion.axis);
+                if motion.moved && let Some(at) = at { cx.propose(self.ratio(cx.rect,coord(self.orientation,at),false)); }
+            }
+            match phase {
+                PressPhase::Release { .. } => { cx.commit(); cx.ctx.data_mut(|d| d.remove::<Motion>(id)); }
+                PressPhase::Cancel { .. } => { cx.cancel(CancelReason::Escape); cx.ctx.data_mut(|d| d.remove::<Motion>(id)); }
+                _ => { cx.ctx.data_mut(|d| d.insert_temp(id,motion)); }
+            }
+        }
+        let line = self.line(cx.rect,cx.value().copied().unwrap_or(0.5),cx.flow.is_rtl());
+        if let Some((_,at)) = divider::keys(cx,EDGE,&[(0,line)],1.0,10.0) { cx.set(self.ratio(cx.rect,at,cx.flow.is_rtl())); }
+    }
+    fn paint_over(&mut self, ui: &mut PaintUi<'_>, _: &Cx<'_, Self>) { ui.face(EDGE.at(0),Splitter::new(axis(self.orientation))); }
+    fn access(&self, access: &mut Access, cx: &Cx<'_, Self>) {
+        let line=self.line(cx.rect,cx.value().copied().unwrap_or(0.5),cx.flow.is_rtl());
+        divider::describe(access,EDGE,0,&line,tl!("Split View divider"),1.0);
+    }
+    fn finish(self, cx: Cx<'_,Self>) -> EditResponse<f32> { cx.edit_response() }
 }
 
+pub(super) fn control(app: &mut VectorcraftApp, ui: &mut Ui, space: &CanvasSpace, win: Win) {
+    if !enabled(app) || craft::ui::runtime::measure::active(ui.ctx()) { return; }
+    let Some(mut split) = doc_windows::view(app,win).map(|v| v.split) else { return };
+    let id=super::canvas_id(win).with(("comparison",split.orientation == SplitOrientation::Horizontal));
+    let owns=ui.ctx().data(|d|d.get_temp::<Motion>(id.with("axis-motion")).is_some());
+    let (space,middle,mods)=ui.input(|i|(i.key_down(egui::Key::Space),i.pointer.middle_down(),i.modifiers));
+    // A selected Hand/Zoom tool still yields its seam press to the divider. Space lends navigation;
+    // while Type edits text only Cmd+Space does, as on the ordinary canvas.
+    let view_tool=space && (!app.session.tool_wants_text() || mods.command);
+    let admit=owns || !middle && !view_tool;
+    let shown = ComparisonDivider { common:Common::new(), fraction:Bind::bound(&mut split.fraction), orientation:split.orientation,admit }
+        .label(tl!("Split View divider")).id(id)
+        .show_at(ui,space.view.rect);
+    let _ = shown;
+    if let Some(view) = doc_windows::view_mut(app,win) { view.split.fraction=split.ratio(); }
+}
+
+/// Mode policy shared by the tool host, hover consumers and point-based canvas picking.
+pub(super) fn view_at(app:&VectorcraftApp,ctx:&egui::Context,at:Option<Pos2>) -> ViewInfo {
+    let mut view=app.view_info();
+    let Some(win)=doc_windows::current(app) else{return view};
+    if let Some(mut held)=ctx.data(|d|d.get_temp::<HeldMode>(held_id())).filter(|m|m.win==win && app.session.active().is_some_and(|st|st.uid==m.doc)) {
+        if held.active || enabled(app) {
+            held.active=true;
+            view.outline=held.outline;view.pixel_preview=held.pixel;
+        } else {
+            // With Split View off, ordinary mode changes retain main's behavior. Remember the
+            // latest ordinary mode only so enabling comparison cannot take over an existing press.
+            held.outline=view.outline;held.pixel=view.pixel_preview;
+        }
+        if !craft::ui::runtime::measure::active(ctx) {ctx.data_mut(|d|d.insert_temp(held_id(),held));}
+    } else if enabled(app) && let (Some(v),Some(canvas),Some(at))=(app.view(),app.canvas_view(),at) {
+        if clips(canvas.rect,v.split)[1].contains(at) {view.outline=v.split.comparison==SplitMode::Outline;view.pixel_preview=v.split.comparison==SplitMode::PixelPreview;}
+    }
+    view
+}
+pub(super) fn view_doc(app:&VectorcraftApp,at:vectorcraft_geom::Point) -> ViewInfo {
+    let Some(ctx)=app.ui_ctx.as_ref() else{return app.view_info()};
+    view_at(app,ctx,app.canvas_view().map(|view|view.to_screen(at)))
+}
+pub(super) fn input_view(app: &VectorcraftApp, ctx: &egui::Context, pass: &craft::ui::canvas::ToolPass) -> ViewInfo {
+    let start=pass.press.phase.start();
+    let at=start.map(|s|s.origin).or_else(||pointer::frame(ctx).pos);
+    let view=view_at(app,ctx,at);
+    if start.is_some() && pass.press.phase.is_press() && let (Some(win),Some(st))=(doc_windows::current(app),app.session.active()) {
+        let held=ctx.data(|d|d.get_temp::<HeldMode>(held_id())).is_some_and(|m|m.win==win && m.doc==st.uid);
+        if !held {ctx.data_mut(|d|d.insert_temp(held_id(),HeldMode {win,doc:st.uid,outline:view.outline,pixel:view.pixel_preview,active:enabled(app)}));}
+    }
+    view
+}
+pub(super) fn end_pass(ctx:&egui::Context,pass:&craft::ui::canvas::ToolPass) {
+    if matches!(pass.press.phase,PressPhase::Release {..}|PressPhase::Cancel {..}) {ctx.data_mut(|d|d.remove::<HeldMode>(held_id()));}
+}
 #[derive(Clone, Copy, PartialEq)]
 struct ModeContext {
     doc: u64,
@@ -42,452 +173,12 @@ struct ModeContext {
     comparison: SplitMode,
 }
 
-fn mode_id() -> egui::Id {
-    egui::Id::unique("canvas-split-mode-context")
-}
-
-fn divider_id() -> egui::Id {
-    egui::Id::unique("canvas-split-divider-drag")
-}
-fn held_id() -> egui::Id {
-    egui::Id::unique("canvas-split-tool-mode")
-}
-
-pub(super) fn enabled(app: &VectorcraftApp) -> bool {
-    app.ui.screen_mode < 3 && app.session.active().is_some() && app.view().is_some_and(|v| v.split.enabled)
-}
-
-pub(super) fn forget(ctx: &egui::Context) {
-    ctx.data_mut(|d| {
-        d.remove::<DividerDrag>(divider_id());
-        d.remove::<HeldMode>(held_id());
-    });
-}
-
-/// Existing canvas cancellation (including a second finger or cancelled contact) also ends
-/// a divider press; unlike Escape it retains the last fraction.
-pub(super) fn cancel_divider(ctx: &egui::Context) {
-    ctx.data_mut(|d| d.remove::<DividerDrag>(divider_id()));
-}
-
-pub(crate) fn dragging(ctx: &egui::Context) -> bool {
-    ctx.data(|d| d.get_temp::<DividerDrag>(divider_id()).is_some())
-}
-
-pub(super) fn suspend(app: &mut VectorcraftApp, ui: &Ui) {
-    app.canvas.split.clear();
-    ui.data_mut(|d| d.remove::<ModeContext>(mode_id()));
-    if let Some(held) = ui.data(|d| d.get_temp::<HeldMode>(held_id()))
-        && app.session.active().is_some_and(|st| st.uid == held.doc)
-    {
-        let mut view = app.view_info();
-        view.outline = held.outline;
-        view.pixel_preview = held.pixel;
-        drag::drop_press(app, ui, view);
-    }
-    forget(ui.ctx());
-}
-
-pub(super) fn clips(rect: egui::Rect, split: SplitView) -> [egui::Rect; 2] {
-    let mut first = rect;
-    let mut second = rect;
-    match split.orientation {
-        SplitOrientation::Vertical => {
-            let x = rect.left() + rect.width() * split.ratio();
-            first.max.x = x;
-            second.min.x = x;
-        }
-        SplitOrientation::Horizontal => {
-            let y = rect.top() + rect.height() * split.ratio();
-            first.max.y = y;
-            second.min.y = y;
-        }
-    }
-    [first, second]
-}
-
-fn hit(rect: egui::Rect, split: SplitView, p: Pos2) -> bool {
-    if !rect.contains(p) {
-        return false;
-    }
-    let edge = clips(rect, split)[0].max;
-    match split.orientation {
-        SplitOrientation::Vertical => (p.x - edge.x).abs() <= 3.0,
-        SplitOrientation::Horizontal => (p.y - edge.y).abs() <= 3.0,
-    }
-}
-
-pub(super) fn on_divider(app: &VectorcraftApp, ui: &Ui, resp: &egui::Response, rect: egui::Rect) -> bool {
-    if !enabled(app) || ui.data(|d| d.get_temp::<Drag>(drag::drag_id()).is_some()) {
-        return false;
-    }
-    if dragging(ui.ctx()) {
-        return true;
-    }
-    let (m, space, middle, at) = ui.input(|i| {
-        (
-            i.modifiers,
-            i.key_down(egui::Key::Space),
-            i.pointer.button_down(egui::PointerButton::Middle),
-            i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()),
-        )
-    });
-    !middle
-        && !drag::space_lends_view_tools(app, m, space)
-        && at.is_some_and(|p| resp.hovered() && drag::on_canvas(ui, resp, p) && app.view().is_some_and(|v| hit(rect, v.split, p)))
-}
-
-/// The last primary press in this frame, with its event index.
-pub(crate) fn primary_press(ui: &Ui) -> Option<(usize, Pos2)> {
-    ui.input(|i| {
-        i.events.iter().enumerate().rev().find_map(|(index, e)| match e {
-            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => Some((index, *pos)),
-            _ => None,
-        })
-    })
-}
-
-/// The last actual middle-button press in this frame, with its event index.
-pub(super) fn middle_press(ui: &Ui) -> Option<(usize, Pos2)> {
-    ui.input(|i| {
-        i.events.iter().enumerate().rev().find_map(|(index, event)| match event {
-            egui::Event::PointerButton { pos, button: egui::PointerButton::Middle, pressed: true, .. } => Some((index, *pos)),
-            _ => None,
-        })
-    })
-}
-
-/// The first primary release, optionally restricted to events after a particular press.
-pub(crate) fn primary_release(ui: &Ui, after: Option<usize>) -> Option<(usize, Pos2)> {
-    ui.input(|i| {
-        i.events.iter().enumerate().find_map(|(index, e)| match e {
-            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. }
-                if after.is_none_or(|press| index > press) =>
-            {
-                Some((index, *pos))
-            }
-            _ => None,
-        })
-    })
-}
-
-/// The first complete primary pair in this frame's prefix, after an already finished owner.
-pub(super) fn completed_primary_press(ui: &Ui, after: Option<usize>, before: usize) -> Option<(usize, Pos2, usize, Pos2)> {
-    let (down, pressed) = ui.input(|i| {
-        i.events.iter().enumerate().find_map(|(index, event)| match event {
-            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. }
-                if index < before && after.is_none_or(|up| index > up) =>
-            {
-                Some((index, *pos))
-            }
-            _ => None,
-        })
-    })?;
-    let (up, released) = primary_release(ui, Some(down))?;
-    (up < before).then_some((down, pressed, up, released))
-}
-
-/// Whether the new primary press belongs to the divider, using that event's position.
-pub(super) fn press_on_divider(app: &VectorcraftApp, ui: &Ui, resp: &egui::Response, rect: egui::Rect) -> bool {
-    enabled(app)
-        && !ui.data(|d| d.get_temp::<Drag>(drag::drag_id()).is_some())
-        && primary_press(ui).is_some_and(|(down, p)| {
-            !drag::middle_before(ui, down) && !drag::primary_press_state(app, ui, down).1 && divider_press_at(app, ui, resp, rect, p)
-        })
-}
-
-pub(super) fn divider_press_at(app: &VectorcraftApp, ui: &Ui, resp: &egui::Response, rect: egui::Rect, p: Pos2) -> bool {
-    drag::on_canvas(ui, resp, p) && app.view().is_some_and(|v| hit(rect, v.split, p))
-}
-
-/// The first completed divider press before this frame's latest Down. This read-only query
-/// also keeps fresh mapped handles from taking a later Down before the divider can finish.
-pub(super) fn completed_press_on_divider(app: &VectorcraftApp, ui: &Ui, resp: &egui::Response, rect: egui::Rect) -> bool {
-    completed_divider_press(app, ui, resp, rect, None, None).is_some()
-}
-
-fn completed_divider_press(
-    app: &VectorcraftApp,
-    ui: &Ui,
-    resp: &egui::Response,
-    rect: egui::Rect,
-    after: Option<usize>,
-    before: Option<usize>,
-) -> Option<(usize, Pos2, usize, Pos2)> {
-    if !enabled(app) || ui.data(|d| d.get_temp::<Drag>(drag::drag_id()).is_some()) {
-        return None;
-    }
-    let latest = before.or_else(|| primary_press(ui).map(|(down, _)| down))?;
-    let presses = ui.input(|i| {
-        i.events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. }
-                    if index < latest && after.is_none_or(|up| index > up) =>
-                {
-                    Some((index, *pos))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    });
-    presses.into_iter().find_map(|(down, p)| {
-        let (up, released) = primary_release(ui, Some(down))?;
-        (up < latest && !drag::middle_before(ui, down) && !drag::primary_press_state(app, ui, down).1 && divider_press_at(app, ui, resp, rect, p))
-            .then_some((down, p, up, released))
-    })
-}
-
-/// Finish only the old divider's release before navigation can handle a later press.
-/// Escape remains owned by divider_input, which restores the original fraction.
-pub(super) fn finish_held_divider_before_press(app: &mut VectorcraftApp, ui: &Ui, rect: egui::Rect, modal: bool) -> Option<usize> {
-    if modal || !enabled(app) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        return None;
-    }
-    let mut held = ui.data(|d| d.get_temp::<DividerDrag>(divider_id()))?;
-    let uid = app.session.active()?.uid;
-    let (_, view) = crate::doc_windows::current(app)?;
-    let settings = app.view()?.split;
-    if held.doc != uid || held.view != view || held.orientation != settings.orientation {
-        return None;
-    }
-    let release = primary_release(ui, None)?;
-    let down = primary_press(ui).map(|(down, _)| down).max(middle_press(ui).map(|(down, _)| down))?;
-    if down <= release.0 {
-        return None;
-    }
-    move_divider(app, ui, rect, held.orientation, &mut held.motion, (None, Some(release)));
-    ui.data_mut(|d| d.remove::<DividerDrag>(divider_id()));
-    ui.ctx().request_repaint();
-    Some(release.0)
-}
-
-/// Whether divider input owned this frame, or ended an old press before a later Down.
-pub(super) enum DividerInput {
-    Ignored,
-    Consumed,
-    Handoff,
-}
-
-/// Called after wheel/touch navigation, before any art/name press. An existing art press keeps
-/// its owner even when it crosses the divider.
-pub(super) fn divider_input(
-    app: &mut VectorcraftApp,
-    ui: &Ui,
-    resp: &egui::Response,
-    rect: egui::Rect,
-    modal: bool,
-    space: bool,
-    mut after: Option<usize>,
-) -> DividerInput {
-    let Some(st) = app.session.active() else {
-        forget(ui.ctx());
-        return DividerInput::Ignored;
-    };
-    let uid = st.uid;
-    let Some((_, view)) = crate::doc_windows::current(app) else { return DividerInput::Ignored };
-    let Some(settings) = app.view().map(|v| v.split).filter(|_| enabled(app)) else { return DividerInput::Ignored };
-    let held = ui.data(|d| d.get_temp::<DividerDrag>(divider_id()));
-    let mut handoff = if let Some(mut held) = held {
-        if held.doc != uid || held.view != view || held.orientation != settings.orientation || modal {
-            ui.data_mut(|d| d.remove::<DividerDrag>(divider_id()));
-            return DividerInput::Ignored;
-        }
-        let escape = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-        if escape {
-            if let Some(v) = app.view_mut() {
-                v.split.fraction = held.start;
-            }
-            ui.data_mut(|d| d.remove::<DividerDrag>(divider_id()));
-            ui.ctx().request_repaint();
-            return DividerInput::Consumed;
-        }
-        let release = primary_release(ui, None);
-        move_divider(app, ui, rect, settings.orientation, &mut held.motion, (None, release));
-        if release.is_some() || !ui.input(|i| i.pointer.primary_down()) {
-            ui.data_mut(|d| d.remove::<DividerDrag>(divider_id()));
-        } else {
-            ui.data_mut(|d| d.insert_temp(divider_id(), held));
-        }
-        ui.ctx().request_repaint();
-        // A later press is a new gesture, admitted against the divider's final position.
-        if !release.is_some_and(|(up, _)| primary_press(ui).is_some_and(|(down, _)| down > up)) {
-            return DividerInput::Consumed;
-        }
-        after = after.max(release.map(|(up, _)| up));
-        true
-    } else {
-        after.is_some()
-    };
-    // Earlier completed divider pairs apply their own Up before ordinary latest-Down admission.
-    if !modal && !crate::touch::finger_navigates_only() {
-        after = finish_completed_dividers(app, ui, resp, rect, after, None);
-        handoff |= after.is_some();
-    }
-    let Some(settings) = app.view().map(|v| v.split) else { return DividerInput::Ignored };
-    let press = primary_press(ui).filter(|(down, _)| after.is_none_or(|up| *down > up));
-    let on = if press.is_some() { press_on_divider(app, ui, resp, rect) } else { on_divider(app, ui, resp, rect) };
-    let press_space = press.map_or(space, |(down, _)| drag::primary_press_state(app, ui, down).1);
-    if modal || press_space || crate::touch::finger_navigates_only() || !on {
-        return if handoff { DividerInput::Handoff } else { DividerInput::Ignored };
-    }
-    if let Some((index, p)) = press {
-        ui.ctx().memory_mut(|mem| mem.stop_text_input());
-        app.ui.flyout = None;
-        // A completed press applies its own release, never a later hover or another press.
-        let mut held = DividerDrag {
-            doc: uid,
-            view,
-            orientation: settings.orientation,
-            start: settings.ratio(),
-            motion: DividerMotion::new(settings.orientation, p),
-        };
-        let release = primary_release(ui, Some(index));
-        move_divider(app, ui, rect, settings.orientation, &mut held.motion, (Some(index), release));
-        if release.is_none() && ui.input(|i| i.pointer.primary_down()) {
-            ui.data_mut(|d| d.insert_temp(divider_id(), held));
-        }
-        if held.motion.moved {
-            ui.ctx().request_repaint();
-        }
-        app.session.tool_press_elsewhere();
-    }
-    app.session.tool_hover_ended(app.view_info());
-    ui.data_mut(|d| d.insert_temp(egui::Id::unique("canvas-hovered"), false));
-    DividerInput::Consumed
-}
-
-/// Finish completed divider pairs before a fresh middle press can start panning.
-pub(super) fn finish_completed_dividers_before_middle(
-    app: &mut VectorcraftApp,
-    ui: &Ui,
-    resp: &egui::Response,
-    rect: egui::Rect,
-    modal: bool,
-    after: Option<usize>,
-) -> Option<usize> {
-    if modal
-        || crate::touch::finger_navigates_only()
-        || !enabled(app)
-        || dragging(ui.ctx())
-        || ui.data(|d| d.get_temp::<Drag>(drag::drag_id()).is_some())
-    {
-        return after;
-    }
-    let Some((before, _)) = middle_press(ui) else { return after };
-    finish_completed_dividers(app, ui, resp, rect, after, Some(before))
-}
-
-/// Each completed pair is hit-tested against the seam left by the previous pair.
-pub(super) fn finish_completed_dividers(
-    app: &mut VectorcraftApp,
-    ui: &Ui,
-    resp: &egui::Response,
-    rect: egui::Rect,
-    mut after: Option<usize>,
-    before: Option<usize>,
-) -> Option<usize> {
-    while let Some((down, p, up, released)) = completed_divider_press(app, ui, resp, rect, after, before) {
-        let Some(settings) = app.view().map(|v| v.split) else { break };
-        let mut motion = DividerMotion::new(settings.orientation, p);
-        move_divider(app, ui, rect, settings.orientation, &mut motion, (Some(down), Some((up, released))));
-        if motion.moved {
-            ui.ctx().request_repaint();
-        }
-        ui.ctx().memory_mut(|mem| mem.stop_text_input());
-        app.ui.flyout = None;
-        app.session.tool_press_elsewhere();
-        after = Some(up);
-    }
-    after
-}
-
-fn divider_axis(orientation: SplitOrientation, p: Pos2) -> f32 {
-    match orientation {
-        SplitOrientation::Vertical => p.x,
-        SplitOrientation::Horizontal => p.y,
-    }
-}
-
-fn move_divider(
-    app: &mut VectorcraftApp,
-    ui: &Ui,
-    rect: egui::Rect,
-    orientation: SplitOrientation,
-    motion: &mut DividerMotion,
-    interval: (Option<usize>, Option<(usize, Pos2)>),
-) {
-    let (after, release) = interval;
-    // Look only at this owner's samples. A move out and back still starts a drag;
-    // a stationary or transverse-only press inside the hit strip does not.
-    motion.moved |= ui.input(|i| {
-        i.events.iter().enumerate().any(|(index, event)| {
-            after.is_none_or(|down| index > down)
-                && release.is_none_or(|(up, _)| index <= up)
-                && match event {
-                    egui::Event::PointerMoved(p) => divider_axis(orientation, *p) != motion.axis,
-                    _ => false,
-                }
-        })
-    });
-    let Some(p) = release.map(|(_, p)| p).or_else(|| ui.input(|i| i.pointer.interact_pos())) else { return };
-    motion.moved |= divider_axis(orientation, p) != motion.axis;
-    if !motion.moved {
-        return;
-    }
-    let value = match orientation {
-        SplitOrientation::Vertical => (p.x - rect.left()) / rect.width().max(1.0),
-        SplitOrientation::Horizontal => (p.y - rect.top()) / rect.height().max(1.0),
-    };
-    if let Some(v) = app.view_mut() {
-        v.split.fraction = value.clamp(0.0, 1.0);
-    }
-}
-
-pub(super) fn input_view(app: &VectorcraftApp, ui: &Ui, rect: egui::Rect, at: Option<Pos2>) -> ViewInfo {
-    let mut view = app.view_info();
-    if ui.data(|d| d.get_temp::<Drag>(drag::drag_id()).is_some_and(drag::tool_holds)) {
-        if let Some(held) = ui.data(|d| d.get_temp::<HeldMode>(held_id()))
-            && app.session.active().is_some_and(|st| st.uid == held.doc)
-        {
-            view.outline = held.outline;
-            view.pixel_preview = held.pixel;
-        }
-    } else if enabled(app)
-        && let (Some(v), Some(p)) = (app.view(), at)
-        && clips(rect, v.split)[1].contains(p)
-    {
-        view.outline = v.split.comparison == SplitMode::Outline;
-        view.pixel_preview = v.split.comparison == SplitMode::PixelPreview;
-    }
-    view
-}
-
-pub(super) fn latch(app: &VectorcraftApp, ui: &Ui, view: ViewInfo) {
-    if enabled(app)
-        && let Some(st) = app.session.active()
-    {
-        ui.data_mut(|d| d.insert_temp(held_id(), HeldMode { doc: st.uid, outline: view.outline, pixel: view.pixel_preview }));
-    }
-}
-
-pub(super) fn end_press(ui: &Ui) {
-    if !ui.data(|d| d.get_temp::<Drag>(drag::drag_id()).is_some_and(drag::tool_holds)) {
-        ui.data_mut(|d| d.remove::<HeldMode>(held_id()));
-    }
-}
-
-pub(super) fn paper(app: &VectorcraftApp, ui: &Ui, painter: &egui::Painter, xf: &Xf, rect: egui::Rect, t: &Tokens) {
-    let (Some(st), Some(v)) = (app.session.active(), app.view()) else { return };
-    for (side, clip) in clips(rect, v.split).into_iter().enumerate() {
-        let outline = if side == 0 { v.outline } else { v.split.comparison == SplitMode::Outline };
-        super::paint_paper(app, st, ui, &painter.with_clip_rect(clip), xf, rect, (t, outline));
-    }
-}
-
-pub(super) fn draw_art(app: &mut VectorcraftApp, ui: &Ui, painter: &egui::Painter, xf: &Xf, rect: egui::Rect, t: &Tokens) {
+fn mode_id() -> egui::Id { egui::Id::unique("split-mode-context") }
+pub(super) fn draw_art(app: &mut VectorcraftApp, ui: &mut Ui, space: &CanvasSpace) {
+    if craft::ui::runtime::measure::active(ui.ctx()) {return;}
     let Some(v) = app.view().copied() else { return };
+    let view=space.view;
+    let rect=view.rect;
     let placed_generation = vectorcraft_render::placed_document::generation();
     let Some(st) = app.session.active() else { return };
     let mode = ModeContext {
@@ -508,13 +199,16 @@ pub(super) fn draw_art(app: &mut VectorcraftApp, ui: &Ui, painter: &egui::Painte
     if mode_changed {
         app.canvas.split.clear();
     }
-    let Some(first) = job(app, ui, xf, rect, t, None) else { return };
-    let Some(mut second) = job(app, ui, xf, rect, t, Some(v.split.comparison)) else { return };
+    let Some(first) = job(app, ui, &view, None) else { return };
+    let Some(mut second) = job(app, ui, &view, Some(v.split.comparison)) else { return };
     // These asynchronous resources can advance between the two job preparations. Bind both
     // sides to one recorded generation/proof snapshot; the next frame observes any later one.
     second.key.plugins = first.key.plugins;
     second.key.placed = first.key.placed;
     second.opts.proof = first.opts.proof.clone();
+    second.key.color=first.key.color.clone();
+    let report_doc=first.doc.clone();
+    let report_effects=first.effects.clone();
     // Single-view results must still be drained while split owns the screen, so completed jobs
     // cannot keep an old document alive indefinitely or upload an unused texture later.
     for worker in [&mut app.canvas.worker, &mut app.canvas.fill_worker].into_iter().flatten() {
@@ -527,16 +221,21 @@ pub(super) fn draw_art(app: &mut VectorcraftApp, ui: &Ui, painter: &egui::Painte
     app.canvas.split.update(ui.ctx(), [first, second]);
     if let Some(pair) = app.canvas.split.shown() {
         app.perf.render_ms = pair.ms;
-        for (side, clip) in clips(rect, v.split).into_iter().enumerate() {
-            if let (Some(texture), Some(key)) = (pair.textures.get(side), pair.keys.get(side)) {
-                super::reproject_texture(&painter.with_clip_rect(clip), xf, rect, texture, key, v.rotation);
+        let (pw,ph)=pair.keys[0].pixel.map_or((pair.keys[0].w,pair.keys[0].h),|[x0,y0,x1,y1]|((x1-x0) as u32,(y1-y0) as u32));
+        let paint = AppPaint::new(|cx:&ContentPainterCx<'_>, at:CanvasView| {
+            for (side,clip) in clips(at.rect,v.split).into_iter().enumerate() {
+                if let (Some(texture),Some(key)) = (pair.textures.get(side),pair.keys.get(side)) {
+                    raster::reproject_texture(&cx.painter.with_clip_rect(clip), &at, at.rect, texture, key, v.rotation);
+                }
             }
-        }
+        });
+        RasterDisplay::painted(tl!("Artwork comparison"),PixelSize::new(pw.max(1),ph.max(1)),paint).picture().show_at(ui,rect);
         // Retire only the document whose complete pair was drawn, never a merely queued view.
         if let Some(st) = app.session.active().filter(|st| pair.keys.iter().all(|key| key.doc == st.uid as usize)) {
             st.plugin_effects.first_view_done();
         }
     }
+    raster::report_rendered(app,&report_doc,&report_effects);
     // Bitmaps can start and finish while a synchronous pair is drawn. Their generation changes
     // before busy becomes false, so also wake for a completion since the pair was prepared.
     if vectorcraft_render::placed_document::busy() || vectorcraft_render::placed_document::generation() != placed_generation {
@@ -544,37 +243,38 @@ pub(super) fn draw_art(app: &mut VectorcraftApp, ui: &Ui, painter: &egui::Painte
     }
 }
 
-fn job(app: &mut VectorcraftApp, ui: &Ui, xf: &Xf, rect: egui::Rect, t: &Tokens, mode: Option<SplitMode>) -> Option<crate::render_worker::Job> {
+fn job(app: &mut VectorcraftApp, ui: &Ui, drawn: &CanvasView, mode: Option<SplitMode>) -> Option<crate::render_worker::Job> {
     let st = app.session.active()?;
     let doc = st.doc.clone();
     let effects = st.plugin_effects.clone();
     let mask_view = st.shown_mask();
-    let drawn = app.view()?.on_screen(app.canvas_ui_zoom);
+    let rect=drawn.rect;
+    let t=Env::of(ui);
     let device_ppp = ui.ctx().pixels_per_point();
     let max_side = ui.ctx().input(|i| i.max_texture_side);
-    let ppp = super::frame_ppp(rect.size(), device_ppp, max_side);
+    let ppp = raster::frame_ppp(rect.size(), device_ppp, max_side);
     let (w, h) = (
         ((rect.width() * ppp).round().max(1.0) as u32).min(u32::from(u16::MAX)),
         ((rect.height() * ppp).round().max(1.0) as u32).min(u32::from(u16::MAX)),
     );
     let pixel_mode = mode.map_or(app.ui.view.pixel_preview, |m| m == SplitMode::PixelPreview);
-    let pixel = (pixel_mode && xf.zoom * f64::from(device_ppp) > 1.0).then(|| super::pixel_region(xf, max_side)).flatten();
+    let pixel = (pixel_mode && drawn.zoom * f64::from(device_ppp) > 1.0).then(|| raster::pixel_region(drawn, max_side)).flatten();
     let smooth = pixel.is_none() || app.session.prefs.anti_aliased_bitmaps;
-    let plugins = super::plugin_key(&mut app.canvas.plugin_keys, &app.session, st);
-    let placed = super::placed_key(&mut app.canvas.placed_keys, &app.session, st);
-    let mut key = super::cache_key(app, ui, st, t, &drawn, (w, h, ppp), (pixel, smooth, plugins, placed));
+    let plugins = raster::plugin_key(&mut app.canvas.plugin_keys, &app.session, st);
+    let placed = raster::placed_key(&mut app.canvas.placed_keys, &app.session, st);
+    let mut key = raster::cache_key(app, ui.ctx(), st, t.tokens.tokens(), drawn, (w, h, ppp), (pixel, smooth, plugins, placed));
     if let Some(mode) = mode {
         key.outline = mode == SplitMode::Outline;
         key.trim = mode == SplitMode::TrimView;
-        key.backdrop = super::backdrop(app, st, key.outline);
+        key.backdrop = raster::backdrop_mode(app, st, key.outline,mode==SplitMode::OverprintPreview);
     }
-    let mut opts = super::frame_options(app, &key, mask_view, smooth);
+    let mut opts = raster::frame_options(app, &key, mask_view, smooth);
     if let Some(mode) = mode {
         opts.outline = mode == SplitMode::Outline;
         opts.trim = mode == SplitMode::TrimView;
         opts.overprint_preview = mode == SplitMode::OverprintPreview;
     }
-    let (w, h, view) = super::frame_view(pixel, (w, h), &drawn, ppp);
+    let (w, h, view) = raster::frame_view(pixel, (w, h), drawn, ppp);
     Some(crate::render_worker::Job {
         key,
         doc,
@@ -590,54 +290,39 @@ fn job(app: &mut VectorcraftApp, ui: &Ui, xf: &Xf, rect: egui::Rect, t: &Tokens,
     })
 }
 
-pub(super) fn mode_overlays(app: &VectorcraftApp, ui: &Ui, painter: &egui::Painter, xf: &Xf, rect: egui::Rect, t: &Tokens) {
-    let Some(v) = app.view() else { return };
-    for (side, clip) in clips(rect, v.split).into_iter().enumerate() {
-        let painter = painter.with_clip_rect(clip);
-        let pixel = if side == 0 { app.ui.view.pixel_preview } else { v.split.comparison == SplitMode::PixelPreview };
-        if pixel && v.zoom >= super::PIXEL_GRID_ZOOM && app.session.prefs.show_pixel_grid {
-            super::grid(&painter, xf, 1.0, 1, super::LineLook { color: super::PIXEL_GRID, dots: false });
-        }
-        let outline = if side == 0 { v.outline } else { v.split.comparison == SplitMode::Outline };
-        super::artboard_outlines_mode(app, ui, &painter, xf, t, outline);
-    }
-}
 
-pub(super) fn divider(app: &VectorcraftApp, painter: &egui::Painter, rect: egui::Rect, t: &Tokens, visible: bool) {
-    if !visible {
-        return;
-    }
-    let Some(v) = app.view() else { return };
-    let edge = clips(rect, v.split)[0].max;
-    let (a, b, grip) = match v.split.orientation {
-        SplitOrientation::Vertical => (
-            egui::pos2(edge.x, rect.top()),
-            egui::pos2(edge.x, rect.bottom()),
-            egui::Rect::from_center_size(egui::pos2(edge.x, rect.center().y), vec2(5.0, 24.0)),
-        ),
-        SplitOrientation::Horizontal => (
-            egui::pos2(rect.left(), edge.y),
-            egui::pos2(rect.right(), edge.y),
-            egui::Rect::from_center_size(egui::pos2(rect.center().x, edge.y), vec2(24.0, 5.0)),
-        ),
-    };
-    painter.line_segment([a, b], egui::Stroke::new(3.0, t.panel));
-    painter.line_segment([a, b], egui::Stroke::new(1.0, t.border));
-    painter.rect_filled(grip, 2.0, t.text_dim);
-}
-
-pub(super) fn cursor(app: &VectorcraftApp, ui: &Ui) -> bool {
-    let Some(rect) = app.canvas_rect else { return false };
-    let Some(v) = app.view().filter(|_| enabled(app)) else { return false };
-    let (at, m, space, middle) =
-        ui.input(|i| (i.pointer.hover_pos(), i.modifiers, i.key_down(egui::Key::Space), i.pointer.button_down(egui::PointerButton::Middle)));
-    let tool_holds = ui.data(|d| d.get_temp::<Drag>(drag::drag_id()).is_some());
-    if dragging(ui.ctx()) || (!tool_holds && !middle && !drag::space_lends_view_tools(app, m, space) && at.is_some_and(|p| hit(rect, v.split, p))) {
-        ui.ctx().set_cursor_icon(match v.split.orientation {
-            SplitOrientation::Vertical => egui::CursorIcon::ResizeHorizontal,
-            SplitOrientation::Horizontal => egui::CursorIcon::ResizeVertical,
+/// One name/rename owner, with mode-specific native paper through the common picture slot.
+pub(super) fn paper(app:&VectorcraftApp,ui:&mut Ui,space:&CanvasSpace,win:Win) {
+    use craft::ui::canvas::{Pasteboard,PageBorder,ArtboardEdge,PasteboardColor,with_canvas_space};
+    use craft::ui::style::{DataColor,StyleCx};
+    let (Some(st),Some(view))=(app.session.documents().get(win.0),doc_windows::view(app,win)) else{return};
+    for (side,clip) in clips(space.view.rect,view.split).into_iter().enumerate() {
+        let outline=if side==0 {view.outline} else {view.split.comparison==SplitMode::Outline};
+        let overprint=if side==0 {vectorcraft_render::proof::overprint_preview_on()} else {view.split.comparison==SplitMode::OverprintPreview};
+        let env=Env::of(ui);
+        let color=if outline || overprint {egui::Color32::WHITE} else if !super::artboards::shows_artboards(app) {
+            super::artboards::paper_color(&st.doc.setup)
+        } else {crate::prefs_dialog::canvas_color(&app.session.prefs.canvas_color)
+            .unwrap_or_else(||StyleCx::of_env(ui.ctx(),&env).color(env.tokens.color.surface.canvas).egui())};
+        let mut child=ui.new_child(egui::UiBuilder::new().max_rect(space.view.rect).id_salt(("split-paper",side)));
+        child.set_clip_rect(ui.clip_rect().intersect(clip));
+        let mut pages=super::artboards::frames(app,st,view,outline);
+        for page in &mut pages {page.name=None;page.renames=false;page.active=None;}
+        let border=if outline {PageBorder::Line} else if overprint {PageBorder::None} else {PageBorder::DropShadow};
+        with_canvas_space(&mut child,space.with_pasteboard(PasteboardColor::Custom(DataColor::new(color))),|ui| {
+            Pasteboard::new(tl!("Comparison artboards"),&pages).border(border).artboard_edge(ArtboardEdge::Plain).shows_outside().show_at(ui,space.view.rect);
         });
-        return true;
     }
-    false
+}
+
+pub(super) fn pixel_grids(app:&VectorcraftApp,ui:&mut Ui,space:&CanvasSpace,win:Win) {
+    let Some(view)=doc_windows::view(app,win) else{return};
+    for (side,clip) in clips(space.view.rect,view.split).into_iter().enumerate() {
+        let pixel=if side==0 {app.ui.view.pixel_preview} else {view.split.comparison==SplitMode::PixelPreview};
+        if let Some(grid)=super::grid::pixel_grid_mode(app,app.print_ppi_of(Some(win)),pixel) {
+            let mut child=ui.new_child(egui::UiBuilder::new().max_rect(space.view.rect).id_salt(("comparison-pixel-grid",side)));
+            child.set_clip_rect(ui.clip_rect().intersect(clip));
+            grid.show_at(&mut child,space.view.rect);
+        }
+    }
 }

@@ -87,6 +87,7 @@ fn key(revision: u64) -> CacheKey {
         trace_source: None,
         display: 0,
         backdrop: None,
+        color: super::super::raster::color_key(),
     }
 }
 
@@ -648,4 +649,22 @@ fn review_597943_synchronous_pairs_wait_only_for_slow_camera_changes() {
     review_597943_step(&mut cache, &ctx, 31.01, review_597943_camera(&base, 6.0));
     assert!(cache.shown().is_some() && cache.latest.is_none(), "clear restores first-pair immediate rendering");
     review_597943_disconnected_pair_waits(&ctx, &base);
+}
+
+#[test]
+fn split_cache_rejects_a_completed_pair_from_an_obsolete_color_generation() {
+    let ctx=egui::Context::default();
+    let (mut cache,probe)=controlled();
+    let mut obsolete=jobs(1);
+    for job in &mut obsolete {job.key.color.2=job.key.color.2.wrapping_add(1);}
+    cache.update(&ctx,obsolete);
+    for job in probe.pair() {probe.finish(job.key,Some(1));}
+    let mut obsolete=jobs(1);
+    for job in &mut obsolete {job.key.color.2=job.key.color.2.wrapping_add(1);}
+    cache.update(&ctx,obsolete);
+    assert!(cache.shown().is_none(),"obsolete color-converted pixels cannot be uploaded as the current pair");
+    cache.update(&ctx,jobs(2));
+    for job in probe.pair() {probe.finish(job.key,Some(2));}
+    cache.update(&ctx,jobs(2));
+    assert!(cache.shown().is_some(),"CONTROL: a coherent pair of the current color context is still presented");
 }

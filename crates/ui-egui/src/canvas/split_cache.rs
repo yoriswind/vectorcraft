@@ -308,7 +308,7 @@ impl SplitCache {
         if sequence <= self.shown_sequence || !self.context.as_ref().is_some_and(|current| current.same_context(&request.identity)) {
             return;
         }
-        if super::placed_changed(
+        if request.identity.keys.iter().any(|key|key.color != super::raster::color_key()) || placed_changed(
             &request.jobs[0].doc,
             request.placed_generation,
             vectorcraft_render::placed_document::generation(),
@@ -394,3 +394,25 @@ fn clone_job(job: &Job) -> Job {
 
 #[cfg(test)]
 mod tests;
+
+fn placed_changed(
+    doc: &vectorcraft_doc::Document,
+    from: u64,
+    to: u64,
+    made: impl FnOnce(u64, u64) -> Option<std::collections::HashSet<String>>,
+) -> bool {
+    if from == to {
+        return false;
+    }
+    let images = &doc.images;
+    // The files made that `doc` holds: a placed document of one of them may show.
+    let files: std::collections::HashSet<String> = if images.is_empty() {
+        Default::default()
+    } else {
+        match made(from, to) {
+            Some(files) => files.into_iter().filter(|f| images.contains_key(f)).collect(),
+            None => images.keys().cloned().collect(),
+        }
+    };
+    !matches!(vectorcraft_render::placed_area(doc, &files), vectorcraft_render::Changed::Nothing)
+}

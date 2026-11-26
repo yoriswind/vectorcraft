@@ -3,9 +3,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::HashMap;
+use std::{cell::RefCell,rc::Rc,ops::{Deref,DerefMut}};
+use craft::behavior::CanvasView;
+use craft::ui::{testing::Fixture,runtime::frame::take_output};
 use std::sync::{Mutex, MutexGuard};
 
-use egui::{Color32, ColorImage, Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, Shape, TextureId, pos2, vec2};
+use egui::{Color32, ColorImage, Event, Key, Modifiers, PointerButton, Pos2, Rect, Shape, TextureId, pos2, vec2};
 use serde_json::{Value, json};
 use vectorcraft_color::cms;
 use vectorcraft_doc::NodeId;
@@ -14,7 +17,6 @@ use vectorcraft_geom::{Point, Rect as DocRect};
 use vectorcraft_ui_egui::{
     VectorcraftApp, canvas, i18n,
     state::{SplitMode, SplitOrientation},
-    theme,
 };
 
 // Each integration case needs a fresh process: render workers read SYNC during startup,
@@ -227,8 +229,15 @@ impl Uploads {
     }
 }
 
+struct AppSlot(Option<VectorcraftApp>);
+impl Deref for AppSlot {type Target=VectorcraftApp;fn deref(&self)->&Self::Target {self.0.as_ref().expect("app is outside its frame")}}
+impl DerefMut for AppSlot {fn deref_mut(&mut self)->&mut Self::Target {self.0.as_mut().expect("app is outside its frame")}}
+
 struct Scene {
-    app: VectorcraftApp,
+    app: AppSlot,
+    fixture: Fixture,
+    bridge: Rc<RefCell<Option<VectorcraftApp>>>,
+    clock: f64,
     ctx: egui::Context,
     output: egui::FullOutput,
     uploaded: Uploads,
@@ -268,29 +277,37 @@ impl Scene {
         v.fitted = true;
         v.center = Point::new(160.0, 120.0);
         v.zoom = 1.5;
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        Self { app, ctx, output: Default::default(), uploaded: Default::default(), size: vec2(640.0, 480.0), time: 0.0, rectangle }
+        let bridge:Rc<RefCell<Option<VectorcraftApp>>>=Rc::default();
+        let in_frame=bridge.clone();
+        let mut fixture=Fixture::new(move |ui| {
+            let mut slot=in_frame.borrow_mut();
+            let app=slot.as_mut().expect("the scene lent its app to the native frame");
+            app.tick(ui.ctx());
+            app.ui(ui);
+            let _=app.frame_input(take_output(ui.ctx()));
+        });
+        fixture.record_paint();
+        let ctx=fixture.ctx().clone();
+        app.adopt_context(&ctx);
+        Self { app:AppSlot(Some(app)), fixture,bridge,clock:0.0,ctx,output:Default::default(),uploaded:Default::default(),size:vec2(1000.0,700.0),time:0.0,rectangle }
     }
 
     fn frame(&mut self, events: Vec<Event>) {
-        self.time += 1.0 / 60.0;
-        let mut raw = RawInput {
-            events,
-            time: Some(self.time),
-            focused: true,
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
-            ..Default::default()
-        };
-        self.app.raw_input_hook(&self.ctx, &mut raw);
-        let mut output = self.ctx.run_ui(raw, |ui| {
-            // App::ui dispatches this actual frontend key handler before painting its canvas.
-            vectorcraft_ui_egui::shortcuts::handle(&mut self.app, ui.ctx());
-            canvas::show(&mut self.app, ui);
-        });
-        self.uploaded.apply(&self.ctx, &output.textures_delta);
+        self.time+=1.0/60.0;
+        let mut raw=egui::RawInput {events,..Default::default()};
+        self.app.raw_input(&self.ctx,&mut raw);
+        let input=self.app.frame_input(take_output(&self.ctx));
+        self.fixture.root(input.root).commands(input.commands).room(self.size).advance((self.time-self.clock).max(0.0));
+        if let Some(host)=input.host {self.fixture.host(host);}
+        self.clock=self.time;
+        *self.bridge.borrow_mut()=self.app.0.take();
+        // Production raw-input preprocessing, then one OS batch through the native H0 queue and its release pass.
+        self.fixture.frame_through(raw.events);
+        self.app.0=self.bridge.borrow_mut().take();
+        let mut output=self.fixture.take_paint().expect("the native fixture records real shapes and every texture delta");
+        self.uploaded.apply(&self.ctx,&output.textures_delta);
         output.textures_delta.clear();
-        self.output = output;
+        self.output=output;
     }
 
     fn idle(&mut self) {
@@ -307,16 +324,21 @@ impl Scene {
         assert!(self.app.view().unwrap().split.enabled);
     }
     fn rect(&self) -> Rect {
-        self.app.canvas_rect.unwrap()
+        self.app.canvas_view().unwrap().rect
     }
-    fn xf(&self) -> canvas::Xf {
-        canvas::Xf::at(self.rect(), self.app.view().unwrap(), self.ctx.zoom_factor())
+    fn xf(&self) -> CanvasView {
+        self.app.view().unwrap().canvas(self.ctx.zoom_factor(),self.rect())
     }
     fn screen(&self, p: Point) -> Pos2 {
         self.xf().to_screen(p)
     }
     fn fraction(&self) -> f32 {
         self.app.view().unwrap().split.ratio()
+    }
+
+    fn first_artboard_name(&self) -> Pos2 {
+        let label=format!("01 - {}",self.app.session.active().unwrap().doc.artboards[0].name);
+        self.fixture.by_label(&label).expect("the actual native artboard-name control is shown").center()
     }
 
     fn point_on_divider(&self) -> Pos2 {
@@ -1119,14 +1141,7 @@ synchronous_test!(review_4625287675_name_release_over_divider_keeps_its_owner, {
     v.zoom = 1.5;
     v.artboard = 1;
     s.enable();
-    fn label_point(shape: &Shape) -> Option<Pos2> {
-        match shape {
-            Shape::Vec(shapes) => shapes.iter().find_map(label_point),
-            Shape::Text(text) if text.galley.job.text.starts_with("01 -") => Some(text.pos + text.galley.rect.center().to_vec2()),
-            _ => None,
-        }
-    }
-    let name = s.output.shapes.iter().find_map(|shape| label_point(&shape.shape)).expect("the actual first artboard name is painted");
+    let name = s.first_artboard_name();
     assert!(s.rect().contains(name), "CONTROL: the name is inside the real canvas");
     let divider = s.point_on_divider();
     assert!((name.x - divider.x).abs() > 20.0, "CONTROL: the name press is away from the divider");
@@ -1182,36 +1197,13 @@ synchronous_test!(review_4625287680_divider_escape_owns_bound_command_and_repeat
 });
 
 // Append-only witnesses. Reuse the existing process isolation, Scene and Globals fixtures.
-fn review8211_materials_label(shape: &Shape) -> Option<Pos2> {
-    match shape {
-        Shape::Vec(children) => children.iter().find_map(review8211_materials_label),
-        Shape::Text(text) if text.galley.text() == "Materials" => Some(text.pos + text.galley.size() * 0.5),
-        _ => None,
-    }
-}
 
 impl Scene {
     fn review8211_materials_frame(&mut self, events: Vec<Event>) {
-        self.time += 1.0 / 60.0;
-        let mut raw = RawInput {
-            events,
-            time: Some(self.time),
-            focused: true,
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size)),
-            ..Default::default()
-        };
-        self.app.raw_input_hook(&self.ctx, &mut raw);
-        let mut output = self.ctx.run_ui(raw, |ui| {
-            vectorcraft_ui_egui::shortcuts::handle(&mut self.app, ui.ctx());
-            egui::Window::new("Review mapped graphic")
-                .fixed_pos(pos2(850.0, 10.0))
-                .default_width(300.0)
-                .show(ui.ctx(), |ui| vectorcraft_ui_egui::panels::three_d::show(&mut self.app, ui));
-            canvas::show(&mut self.app, ui);
-        });
-        self.uploaded.apply(&self.ctx, &output.textures_delta);
-        output.textures_delta.clear();
-        self.output = output;
+        if vectorcraft_ui_egui::menus::checked(&self.app,"window.panel",&json!({"panel":"threeD"})) != Some(true) {
+            self.app.run("window.panel",json!({"panel":"threeD"})).unwrap();
+        }
+        self.frame(events);
     }
 }
 
@@ -1229,7 +1221,7 @@ fn review8211_mapped_scene() -> (Scene, Pos2) {
     for _ in 0..3 {
         s.review8211_materials_frame(vec![]);
     }
-    let tab = s.output.shapes.iter().find_map(|s| review8211_materials_label(&s.shape)).expect("CONTROL: actual Materials tab is shown");
+    let tab = s.fixture.by_label("Materials").expect("CONTROL: the actual native Materials tab is shown").center();
     s.review8211_materials_frame(vec![Event::PointerMoved(tab)]);
     s.review8211_materials_frame(vec![Event::PointerButton { pos: tab, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }]);
     s.review8211_materials_frame(vec![Event::PointerButton { pos: tab, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]);
@@ -2326,14 +2318,7 @@ fn review_598046_name_scene() -> (Scene, Pos2) {
     v.zoom = 1.5;
     v.artboard = 1;
     s.enable();
-    fn label(shape: &Shape) -> Option<Pos2> {
-        match shape {
-            Shape::Vec(shapes) => shapes.iter().find_map(label),
-            Shape::Text(text) if text.galley.job.text.starts_with("01 -") => Some(text.pos + text.galley.rect.center().to_vec2()),
-            _ => None,
-        }
-    }
-    let name = s.output.shapes.iter().find_map(|shape| label(&shape.shape)).expect("CONTROL: actual first artboard label is painted");
+    let name = s.first_artboard_name();
     assert!(s.rect().contains(name));
     assert!((name.x - s.point_on_divider().x).abs() > 20.0);
     (s, name)
@@ -2454,11 +2439,8 @@ fn review_598046_pan_final_up_then_handle(expected: Option<((Point, f64, f64), P
     let hover = up + vec2(17.0, 13.0);
     let expected_graphics = {
         // The separate-frame camera supplies the real final coordinate mapping for both variants.
-        let xf = canvas::Xf::at(
-            s.rect(),
-            &vectorcraft_ui_egui::state::View { center: camera.0, zoom: camera.1, rotation: camera.2, ..*s.app.view().unwrap() },
-            s.ctx.zoom_factor(),
-        );
+        let xf = vectorcraft_ui_egui::state::View { center: camera.0, zoom: camera.1, rotation: camera.2, ..*s.app.view().unwrap() }
+            .canvas(s.ctx.zoom_factor(),s.rect());
         let doc = &s.app.session.active().unwrap().doc;
         let node = doc.node(s.rectangle).unwrap();
         let frame = vectorcraft_effects::graphic_frame_at(Some(doc), node, None, 0).unwrap();
@@ -2768,13 +2750,6 @@ synchronous_test!(review_598151_animated_zoom_owned_excursion_is_not_a_click, {
     review_598151_scrub_out_and_back(true, false);
 });
 
-fn review_599336_name_position(shape: &Shape) -> Option<Pos2> {
-    match shape {
-        Shape::Vec(shapes) => shapes.iter().find_map(review_599336_name_position),
-        Shape::Text(text) if text.galley.job.text.starts_with("01 -") => Some(text.pos + text.galley.rect.center().to_vec2()),
-        _ => None,
-    }
-}
 
 fn review_599336_name_mapped_scene() -> (Scene, Pos2, Pos2) {
     let (mut s, _) = review8211_mapped_scene();
@@ -2789,12 +2764,7 @@ fn review_599336_name_mapped_scene() -> (Scene, Pos2, Pos2) {
     for _ in 0..3 {
         s.review8211_materials_frame(vec![]);
     }
-    let name = s
-        .output
-        .shapes
-        .iter()
-        .find_map(|shape| review_599336_name_position(&shape.shape))
-        .expect("CONTROL: the actual first artboard name is painted");
+    let name = s.first_artboard_name();
     let handle = review_598046_current_mapped_handle(&s);
     assert!(s.rect().contains(name) && s.rect().contains(handle));
     assert!((name.x - s.point_on_divider().x).abs() > 20.0 && (handle.x - s.point_on_divider().x).abs() > 20.0);
@@ -3176,7 +3146,7 @@ fn review_599512_cold_name_mapping(coalesced: bool, artboard_tool: bool, own_shi
         s.app.run("select.set", json!({"ids":[s.rectangle.0]})).unwrap();
         s.app.session.set_tool_option("active", &json!(1));
         s.review8211_materials_frame(vec![]);
-        name = s.output.shapes.iter().find_map(|s| review_599336_name_position(&s.shape)).expect("the actual unselected first name is painted");
+        name = s.first_artboard_name();
         handle = review_598046_current_mapped_handle(&s);
         assert_eq!(s.app.session.active().unwrap().selection.objects, vec![s.rectangle]);
         assert_eq!(s.app.session.tool_options()["selected"], json!([1]));
@@ -3383,4 +3353,43 @@ synchronous_test!(review_599512_completed_divider_keeps_later_middle_pan, {
         let actual = review_599512_off_canvas_middle_control(command, true);
         assert!(actual.0.distance(ordinary.0) < 1e-6 && (actual.1 - ordinary.1).abs() < 1e-9 && (actual.2 - ordinary.2).abs() < 1e-9);
     }
+});
+
+/// The ordinary stroke must finish before the later divider press, even when the OS batches them.
+fn review_599512_paintbrush_before_divider(coalesced:bool) -> Value {
+    let mut s=Scene::new();
+    s.enable();
+    s.app.run("select.set",json!({"ids":[]})).unwrap();
+    s.app.run("paint.setStroke",json!({"color":"#183f89"})).unwrap();
+    s.app.select_tool("paintbrush");
+    s.idle();
+    let before=s.app.session.active().unwrap().doc.clone();
+    let history=s.app.session.active().unwrap().history.undo.len();
+    let camera=review_597943_camera(&s);
+    let start=s.screen(Point::new(35.0,80.0));
+    let middle=s.screen(Point::new(75.0,90.0));
+    let end=s.screen(Point::new(115.0,100.0));
+    let seam=s.point_on_divider();
+    assert!(s.rect().contains(start)&&s.rect().contains(end));
+    assert!((start.x-seam.x).abs()>12.0&&(end.x-seam.x).abs()>12.0);
+    let events=vec![Event::PointerMoved(start),review_597489_primary(start,true),Event::PointerMoved(middle),Event::PointerMoved(end),review_597489_primary(end,false),Event::PointerMoved(seam),review_597489_primary(seam,true)];
+    if coalesced {s.frame(events);} else {for event in events {s.frame(vec![event]);}}
+    let stroke=s.snapshot();
+    assert_ne!(s.app.session.active().unwrap().doc,before,"the completed real Paintbrush stroke survives admission of the seam press");
+    assert_eq!(s.app.session.active().unwrap().history.undo.len(),history+1,"the stroke commits exactly once");
+    let moved=pos2(s.rect().left()+s.rect().width()*0.72,seam.y);
+    s.frame(vec![Event::PointerMoved(moved)]);
+    s.release(moved,PointerButton::Primary);
+    assert!((s.fraction()-0.72).abs()<1e-6,"the later real divider press owns its following movement");
+    assert_eq!(s.snapshot(),stroke,"the divider cannot edit the completed stroke or add history");
+    review_597943_camera_eq(&s,camera);
+    s.app.run("edit.undo",json!({})).unwrap();
+    assert_eq!(s.app.session.active().unwrap().doc,before,"one Undo restores the whole original document");
+    stroke
+}
+synchronous_test!(review_599512_completed_paintbrush_stroke_precedes_divider_admission, {
+    let _globals=Globals::new();
+    let separate=review_599512_paintbrush_before_divider(false);
+    let batched=review_599512_paintbrush_before_divider(true);
+    assert_eq!(batched,separate,"native queued input preserves the same stroke, selection and history as separate frames");
 });
