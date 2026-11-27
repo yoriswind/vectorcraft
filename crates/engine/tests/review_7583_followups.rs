@@ -1293,6 +1293,50 @@ mod review_597585_adoption_options {
     }
 
     #[test]
+    fn review_4630429551_identical_symbol_art_reuses_only_identical_options() {
+        let _context = FixtureContext::hold();
+        let directory = TestDirectory::new();
+        let native = review597585_options_source(true);
+        let loaded = write_native(&directory.0.join("same-art-source.vectorcraft"), &native);
+        let expected = review597585_options(&loaded, SYMBOL);
+        let source_symbol = loaded.symbols.iter().find(|symbol| symbol.name == SYMBOL).unwrap().clone();
+        for variant in ["same", "pixel", "guides"] {
+            let mut outer = loaded.clone();
+            outer.layers = Document::new(80.0, 60.0).layers;
+            outer.swatches.clear();
+            outer.swatch_groups.clear();
+            outer.fix_next_id();
+            let mut destination = Session::new();
+            destination.add_document(outer, None);
+            match variant {
+                "pixel" => { destination.execute("symbol.options", &json!({"name": SYMBOL, "alignToPixelGrid": false})).unwrap(); }
+                "guides" => { destination.execute("symbol.options", &json!({"name": SYMBOL, "nineSliceGuides": [0.1, 0.2, 0.15, 0.25]})).unwrap(); }
+                _ => {}
+            }
+            let mut outer = document(&destination).clone();
+            assert_eq!(outer.symbols.iter().find(|symbol| symbol.name == SYMBOL).unwrap(), &source_symbol, "CONTROL: the source and destination art are identical");
+            let old_options = review597585_options(&outer, SYMBOL);
+            assert_eq!(old_options == expected, variant == "same", "CONTROL: only the requested document-level options differ");
+            let old_user = Node::new(outer.alloc_id(), NodeKind::SymbolInstance { symbol: SYMBOL.into(), xf: Affine::IDENTITY });
+            let old_tile = "Review4630429551 existing tile";
+            outer.patterns.push(PatternDef::new(old_tile, vec![Arc::new(old_user)]));
+            outer.swatches.push(Swatch {
+                name: old_tile.into(),
+                paint: Paint::Pattern { pattern: old_tile.into(), xf: Affine::IDENTITY },
+                global: false,
+                spot: false,
+            });
+            for d in review597585_options_capture(&directory.0, &format!("same-art-{variant}"), &loaded, outer) {
+                let (name, _) = review597585_options_user(&d);
+                assert_eq!(name == SYMBOL, variant == "same", "REGRESSION: identical art shares only identical options");
+                assert_eq!(review597585_options(&d, &name), expected, "the incoming instance retains all source options");
+                assert_eq!(review597585_options(&d, SYMBOL), old_options, "the existing destination's options remain intact");
+                assert_eq!(d.symbols.len(), if variant == "same" { 1 } else { 2 }, "same options share; different options get one alias");
+            }
+        }
+    }
+
+    #[test]
     fn review_597585_adoption_native_symbol_options_and_slice_coordinates_survive_restart() {
         let _context = FixtureContext::hold();
         let directory = TestDirectory::new();

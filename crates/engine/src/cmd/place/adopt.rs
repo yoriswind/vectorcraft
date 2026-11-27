@@ -126,6 +126,9 @@ fn refs(n: &mut Node, f: &mut impl FnMut(Ref)) {
                         f(Ref::Symbol(&mut inline.symbol));
                     }
                 }
+                if let Some(fonts) = &mut t.file_fonts {
+                    fonts.map_keys(|key| f(Ref::Image(key)));
+                }
             }
             NodeKind::Image(im) => f(Ref::Image(&mut im.key)),
             NodeKind::PlacedDocument(pl) => f(Ref::Image(&mut pl.key)),
@@ -360,7 +363,9 @@ pub(crate) fn adopt(dst: &mut Document, src: &Document, nodes: &mut [Node], cmd:
         &used.symbols,
         |n| src.symbols.iter().find(|s| s.name == n),
         |n| dst.symbols.iter().find(|s| s.name == n),
-        |a, b| same_symbol(dst, a, b),
+        |existing, incoming| {
+            same_symbol(dst, existing, incoming) && SymbolOptions::of(dst, &existing.name) == SymbolOptions::of(src, &incoming.name)
+        },
         |c| dst.symbols.iter().any(|s| s.name == c),
     );
     let mut patterns = names(&used.patterns, |n| src.pattern(n), |n| dst.pattern(n), |a, b| same_pattern(dst, a, b), |c| dst.pattern(c).is_some());
@@ -452,6 +457,19 @@ pub(crate) fn adopt(dst: &mut Document, src: &Document, nodes: &mut [Node], cmd:
     for (old, new) in copies(&images) {
         if let Some(blob) = src.images.get(old) {
             dst.images.insert(new.to_string(), blob.clone());
+        }
+    }
+    // Equal font bytes can reuse an existing image entry whose runtime lease is still empty.
+    // Transfer the validated source lease too: cached text nodes hold only weak references.
+    for (old, (new, copy)) in &images {
+        if *copy {
+            continue;
+        }
+        let Some(blob) = src.images.get(old).filter(|b| b.mime == vectorcraft_doc::FILE_FONT_MIME) else { continue };
+        let Some(target) = new.as_ref().and_then(|key| dst.images.get_mut(key)) else { continue };
+        let owner = blob.file_font.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(face) = owner.as_ref().filter(|face| std::ptr::eq(face.bytes(), blob.bytes.as_slice()) || face.bytes() == blob.bytes.as_slice()) {
+            *target.file_font.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(face.clone());
         }
     }
     for (old, new) in copies(&symbols) {

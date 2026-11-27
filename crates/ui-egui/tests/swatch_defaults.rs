@@ -2,18 +2,20 @@
 // Integration tests may unwrap and panic (AGENTS.md, Robustness).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use egui_kittest::kittest::Queryable;
+use craft::ui::runtime::access::Role;
+use craft::ui::runtime::frame::take_output;
+use craft::ui::testing::{Fixture, Target};
 use serde_json::{Value, json};
 use vectorcraft_engine::Session;
-use vectorcraft_ui_egui::{UiState, VectorcraftApp, panels::swatches, prefs_dialog};
+use vectorcraft_ui_egui::{UiState, VectorcraftApp, prefs_dialog};
 
 static CASE: Mutex<()> = Mutex::new(());
-const SAVE: &str = "   Use Current Swatches as Default";
-const RESET: &str = "   Restore Factory Default Swatches";
+const SAVE: &str = "Use Current Swatches as Default";
+const RESET: &str = "Restore Factory Default Swatches";
 
 fn palette(app: &VectorcraftApp) -> Value {
     let d = &app.session.active().unwrap().doc;
@@ -39,33 +41,69 @@ fn source_app() -> VectorcraftApp {
     app
 }
 
-fn panel(app: VectorcraftApp) -> (egui_kittest::Harness<'static, VectorcraftApp>, egui::Context) {
-    let context = Rc::new(RefCell::new(None));
-    let captured = context.clone();
-    let h = egui_kittest::Harness::builder()
-        .with_size(egui::vec2(800.0, 900.0))
-        .with_step_dt(0.1)
-        .with_accessibility_check(false)
-        .with_context_setup(move |ctx| {
-            vectorcraft_ui_egui::theme::install_fonts(ctx);
-            // Same actual egui panel-state keys as the existing Swatches tests.
-            ctx.data_mut(|d| {
-                d.insert_temp(egui::Id::unique(("panel-state", "swatch-show-find")), true);
-                d.insert_temp(egui::Id::unique("swatch-find"), "Visible".to_string());
-            });
-            *captured.borrow_mut() = Some(ctx.clone());
-        })
-        .build_ui_state(
-            |ui, app: &mut VectorcraftApp| {
-                ui.columns(2, |columns| {
-                    swatches::show(app, &mut columns[0]);
-                    swatches::menu(app, &mut columns[1]);
-                });
-            },
-            app,
-        );
-    let ctx = context.borrow().clone().unwrap();
-    (h, ctx)
+/// The real current-main dock and panel menu on the native fixture's window context.
+struct Panel {
+    fixture: Fixture,
+    app: Rc<RefCell<VectorcraftApp>>,
+}
+
+impl Panel {
+    fn state(&self) -> Ref<'_, VectorcraftApp> { self.app.borrow() }
+    fn state_mut(&self) -> RefMut<'_, VectorcraftApp> { self.app.borrow_mut() }
+
+    fn input(&mut self) {
+        let input = self.app.borrow_mut().frame_input(take_output(self.fixture.ctx()));
+        self.fixture.root(input.root).commands(input.commands);
+        if let Some(host) = input.host { self.fixture.host(host); }
+    }
+
+    fn run_steps(&mut self, count: usize) {
+        for _ in 0..count {
+            self.input();
+            self.fixture.frame(vec![]);
+            self.input();
+        }
+    }
+
+    fn target(&self, role: Role, label: &str) -> Target {
+        self.fixture.by_role(role).into_iter().find(|t| self.fixture.tree().name_of(t.node) == Some(label))
+            .unwrap_or_else(|| panic!("missing {label:?} in {:?}", self.fixture.tree().keys().into_iter().filter_map(|k| self.fixture.tree().name_of(k)).collect::<Vec<_>>()))
+    }
+
+    fn click_target(&mut self, target: Target) {
+        self.fixture.click(&target);
+        self.input();
+        self.run_steps(2);
+    }
+
+    fn menu(&mut self) {
+        self.run_steps(1);
+        let tree = self.fixture.tree();
+        let menu = self.fixture.by_role(Role::BUTTON).into_iter().find(|target| {
+            if tree.name_of(target.node) != Some("Panel menu") { return false; }
+            let mut at = tree.parent_of_key(target.node);
+            while let Some(key) = at {
+                if tree.name_of(key).is_some_and(|name| name.contains("Swatches")) { return true; }
+                at = tree.parent_of_key(key);
+            }
+            false
+        }).expect("the actual Swatches dock owns a panel menu");
+        self.click_target(menu);
+    }
+}
+
+fn panel(app: VectorcraftApp) -> Panel {
+    let app = Rc::new(RefCell::new(app));
+    let shown = Rc::clone(&app);
+    let mut fixture = Fixture::new(move |ui| shown.borrow_mut().ui(ui));
+    fixture.room(egui::vec2(1200.0, 1000.0));
+    app.borrow_mut().ui_ctx = Some(fixture.ctx().clone());
+    app.borrow_mut().run("window.panel", json!({"panel": "swatches"})).unwrap();
+    let mut panel = Panel { fixture, app };
+    panel.run_steps(3);
+    // Opening the real dock can save its layout; the command boundary starts after setup.
+    panel.state_mut().take_prefs_changed();
+    panel
 }
 
 fn restored(app: &VectorcraftApp) -> VectorcraftApp {
@@ -78,23 +116,33 @@ fn restored(app: &VectorcraftApp) -> VectorcraftApp {
     fresh
 }
 
-fn click(h: &mut egui_kittest::Harness<'_, VectorcraftApp>, label: &str) {
-    h.get_by_role_and_label(egui::accesskit::Role::Button, label).click();
-    h.run_steps(3);
+fn click(h: &mut Panel, label: &str) {
+    h.menu();
+    let row = h.target(Role::MENU_ITEM, label);
+    h.click_target(row);
 }
 
 #[test]
 fn swatch_defaults_menu_saves_all_rows_and_restores_factory_after_preferences_roundtrip() {
     let _case = CASE.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut h, ctx) = panel(source_app());
+    let mut h = panel(source_app());
     h.run_steps(3);
-    ctx.data_mut(|d| d.insert_temp(egui::Id::unique(("panel-state", "swatch-selected")), vec!["Visible Blue".to_string()]));
+    let swatch = h.fixture.by_label("Visible Blue").expect("the actual visible swatch row");
+    h.click_target(swatch);
+    h.state_mut().run("ui.swatches.showFind", json!({})).unwrap();
     h.run_steps(2);
-    assert!(ctx.read_response(egui::Id::unique(("swatch-tile", "Visible Blue"))).is_some());
-    assert!(ctx.read_response(egui::Id::unique(("swatch-tile", "Hidden Ink"))).is_none(), "Find hides a swatch that must still be saved");
-    let selected: Vec<String> = ctx.data(|d| d.get_temp(egui::Id::unique(("panel-state", "swatch-selected")))).unwrap();
-    assert_eq!(selected, ["Visible Blue"]);
-    let expected = palette(h.state());
+    let search = h.fixture.by_label("Search").expect("the current native swatch search field");
+    h.fixture.click(&search).type_text("Visible");
+    h.input();
+    h.run_steps(3);
+    assert!(h.fixture.by_label("Visible Blue").is_some());
+    assert!(h.fixture.by_label("Hidden Ink").is_none(), "Find hides a swatch that must still be saved");
+    let tree = h.fixture.tree();
+    let visible = h.fixture.by_label("Visible Blue").unwrap();
+    assert_eq!(tree.selected_of(visible.node), Some(true), "the visible row stays selected");
+    // Find is now a real panel preference rather than an egui test-memory key.
+    h.state_mut().take_prefs_changed();
+    let expected = palette(&h.state());
     assert_eq!(expected["groups"].as_array().unwrap().len(), 3);
     assert_eq!(expected["groups"][2]["name"], "Empty");
     assert!(expected["groups"][2]["swatches"].as_array().unwrap().is_empty());
@@ -108,7 +156,7 @@ fn swatch_defaults_menu_saves_all_rows_and_restores_factory_after_preferences_ro
     assert_eq!(h.state().ui.engine_prefs, h.state().session.prefs.to_json(), "the UI payload includes the engine choice");
     assert_eq!(serde_json::to_value(&*h.state().session.active().unwrap().doc).unwrap(), original);
     assert_eq!(h.state().session.active().unwrap().history.undo.len(), undo);
-    let mut fresh = restored(h.state());
+    let mut fresh = restored(&h.state());
     fresh.run("file.new", json!({"width": 200, "height": 200, "profile": null})).unwrap();
     assert_eq!(palette(&fresh), expected, "the whole ordered palette, including hidden and empty groups, survives restart");
 
@@ -118,7 +166,7 @@ fn swatch_defaults_menu_saves_all_rows_and_restores_factory_after_preferences_ro
     assert_eq!(h.state().ui.engine_prefs, h.state().session.prefs.to_json());
     assert_eq!(serde_json::to_value(&*h.state().session.active().unwrap().doc).unwrap(), original, "Factory affects future documents");
     assert_eq!(h.state().session.active().unwrap().history.undo.len(), undo);
-    let mut factory = restored(h.state());
+    let mut factory = restored(&h.state());
     factory.run("file.new", json!({"width": 200, "height": 200})).unwrap();
     let mut stock = VectorcraftApp::new(Session::new(), Default::default());
     stock.run("file.new", json!({"width": 200, "height": 200})).unwrap();
@@ -132,11 +180,11 @@ fn swatch_defaults_failed_command_keeps_the_saved_payload_and_host_flag() {
     let mut original = source_app();
     original.run("swatch.defaults.save", json!({})).unwrap();
     assert!(original.take_prefs_changed());
-    let (mut h, _) = panel(restored(&original));
+    let mut h = panel(restored(&original));
     h.run_steps(3);
     assert!(h.state().session.active().is_none());
     assert!(!h.state_mut().take_prefs_changed());
-    assert!(!vectorcraft_ui_egui::menus::enabled(h.state(), "swatch.defaults.save"));
+    assert!(!vectorcraft_ui_egui::menus::enabled(&h.state(), "swatch.defaults.save"));
     let saved = h.state().ui.engine_prefs.clone();
     let prefs = h.state().session.prefs.to_json();
     click(&mut h, SAVE);
