@@ -804,9 +804,10 @@ fn review_597368_collinear_scale_drag_and_undo(f: &mut Fixture, raw: Point) -> P
     let bounds = now.geometric_bounds().unwrap();
     assert_eq!(actual.y, pivot.y, "CONTROL: horizontal Shift trajectory remains horizontal");
     assert!(
-        (actual.x < pivot.x && bounds.x1 == pivot.x && bounds.y1 == pivot.y) || (actual.x > pivot.x && bounds.x0 == pivot.x && bounds.y0 == pivot.y),
-        "CONTROL: the original pivot is fixed for either allowed uniform-scale sign: {bounds:?}"
+        (actual.x < pivot.x && bounds.x1 == pivot.x) || (actual.x > pivot.x && bounds.x0 == pivot.x),
+        "CONTROL: the original pivot is fixed for either allowed horizontal-scale sign: {bounds:?}"
     );
+    assert_eq!((bounds.y0, bounds.y1), (pivot.y, pivot.y + 100.0), "CONTROL: the current horizontal Shift-axis rule leaves height unchanged");
     assert_eq!(now.appearance, old.appearance);
     assert_eq!(state.selection, selected);
     let mut untouched = (*state.doc).clone();

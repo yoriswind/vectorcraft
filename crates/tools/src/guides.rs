@@ -29,7 +29,7 @@ pub(crate) use bitangent::TangentLine;
 pub use snap::{
     DEFAULT_CONSTRUCTION_ANGLES, DrawSnap, HandleSnap, Leave, PointSnap, construction_angles, distance_guides, snap_draw, snap_pick, square,
 };
-pub(crate) use snap::{PickSnap, hold_on_path};
+pub(crate) use snap::{PickSnap, SnapSettings, hold_on_path};
 pub(crate) use stroke::{ContactDomain, DomainRect};
 use targets::Kind;
 pub use targets::Targets;

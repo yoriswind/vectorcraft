@@ -810,7 +810,8 @@ impl Targets {
     }
 
     pub(super) fn snap_from_with_stroke_minimum(&self, p: Point, from: Option<&Leave>, tol: f64, minimum: Option<f64>) -> (Point, Vec<Overlay>) {
-        self.snap_from_inner(p, from, tol, true, minimum)
+        let (point, guides, _) = self.snap_from_inner(p, from, tol, true, minimum);
+        (point, guides)
     }
 
     /// Preserve legacy point/segment priority, then contact only a solver-placed Scale grab.
@@ -824,11 +825,13 @@ impl Targets {
         valid_contact: impl Fn(Point) -> bool,
     ) -> (Point, Vec<Overlay>) {
         if self.nearest_point(raw, tol).is_some_and(|(q, _)| valid_contact(q)) {
-            return self.snap_from_inner(raw, None, tol, false, None);
+            let (point, guides, _) = self.snap_from_inner(raw, None, tol, false, None);
+            return (point, guides);
         }
         let Some(stroke) = self.snap_stroke_point_with_domain((raw, actual), &[], along, tol, domain, |handle, _| valid_contact(handle)) else {
             // Without an eligible painted contact, preserve the ordinary legacy route exactly.
-            return self.snap_from_inner(raw, None, tol, false, None);
+            let (point, guides, _) = self.snap_from_inner(raw, None, tol, false, None);
+            return (point, guides);
         };
         if let Some((q, kind)) = self.nearest_point_with(raw, tol, &valid_contact) {
             return (q, self.label(q, kind.label()).into_iter().collect());
@@ -842,7 +845,12 @@ impl Targets {
         stroke
     }
 
-    fn snap_from_inner(&self, p: Point, from: Option<&Leave>, tol: f64, stroke_edges: bool, minimum: Option<f64>) -> (Point, Vec<Overlay>) {
+    /// The same placement and whether it made geometric contact, independently of guide visibility.
+    pub(crate) fn snap_hit(&self, p: Point, from: Option<&Leave>, tol: f64) -> (Point, Vec<Overlay>, bool) {
+        self.snap_from_inner(p, from, tol, true, None)
+    }
+
+    fn snap_from_inner(&self, p: Point, from: Option<&Leave>, tol: f64, stroke_edges: bool, minimum: Option<f64>) -> (Point, Vec<Overlay>, bool) {
         if let Some(f) = from
             && let Some(q) = f.constrained(p)
         {
@@ -851,32 +859,32 @@ impl Targets {
             let legacy = minimum.map(|_| self.slide(f.at, q - f.at, q, tol, true));
             let minimum = minimum.filter(|m| legacy.flatten().map_or(q, |(p, _)| p).distance(f.at) >= *m);
             if stroke_edges && let Some((q, kind)) = self.stroke_line_with_minimum(f.at, q - f.at, q, tol, true, minimum) {
-                return (q, self.label(q, kind.label()).into_iter().collect());
+                return (q, self.label(q, kind.label()).into_iter().collect(), true);
             }
             return match legacy.unwrap_or_else(|| self.slide(f.at, q - f.at, q, tol, true)) {
-                Some((q, target)) => (q, self.lined_up(q, target)),
-                None => (q, vec![]),
+                Some((q, target)) => (q, self.lined_up(q, target), true),
+                None => (q, vec![], false),
             };
         }
         if let Some((q, k)) = self.nearest_point(p, tol) {
-            return (q, self.label(q, k.label()).into_iter().collect());
+            return (q, self.label(q, k.label()).into_iter().collect(), true);
         }
         if let Some(q) = self.crossing(p, tol) {
-            return (q, self.label(q, "intersect").into_iter().collect());
+            return (q, self.label(q, "intersect").into_iter().collect(), true);
         }
         if let Some(f) = from.filter(|f| f.contact)
             && let Some((q, perpendicular, dir)) = self.touching(f.at, p, tol)
         {
-            return (q, self.touch_guides(f.at, q, perpendicular, dir, tol));
+            return (q, self.touch_guides(f.at, q, perpendicular, dir, tol), true);
         }
         if let Some(q) = self.on_segment(p, tol) {
-            return (q, self.label(q, Kind::Edge.label()).into_iter().collect());
+            return (q, self.label(q, Kind::Edge.label()).into_iter().collect(), true);
         }
         if stroke_edges
             && self.stroke_points
             && let Some(q) = self.stroke_contours.nearest(p, tol)
         {
-            return (q, self.label(q, "stroke edge").into_iter().collect());
+            return (q, self.label(q, "stroke edge").into_iter().collect(), true);
         }
         // A construction guide through the point it leaves, else a dragged segment's extension:
         // it lands on the guide, sliding into line with a target crossing it nearby.
@@ -887,11 +895,11 @@ impl Targets {
         {
             let construction = |q: Point| Overlay::Line { a: at, b: q, color: self.style.color, dashed: false };
             if stroke_edges && let Some((q, kind)) = self.stroke_line(at, dir, q, tol, false) {
-                return (q, std::iter::once(construction(q)).chain(self.label(q, kind.label())).collect());
+                return (q, std::iter::once(construction(q)).chain(self.label(q, kind.label())).collect(), true);
             }
             return match self.slide(at, dir, q, tol, false) {
-                Some((q, target)) => (q, std::iter::once(construction(q)).chain(self.lined_up(q, target)).collect()),
-                None => (q, vec![construction(q)]),
+                Some((q, target)) => (q, std::iter::once(construction(q)).chain(self.lined_up(q, target)).collect(), true),
+                None => (q, vec![construction(q)], true),
             };
         }
         let mut out = p;
@@ -921,7 +929,7 @@ impl Targets {
         if aligned {
             ov.extend(self.label(out, "align"));
         }
-        (out, ov)
+        (out, ov, aligned)
     }
 
     /// Where a line from `at` through a point near `p` touches a target segment: square to it

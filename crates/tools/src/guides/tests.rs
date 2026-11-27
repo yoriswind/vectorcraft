@@ -2659,8 +2659,8 @@ fn review_599225_zero_grab_ruler_contact_beats_bounds_paint() {
             let actual = review_599225_body_move(57.0, Some(187.0), false, on, show, Some(202.0));
             assert_eq!(
                 actual.0,
-                Point::new(187.0, 150.0),
-                "REGRESSION: the actual zero-travel grab contact is not replaced by a farther bounds contact: on={on}, show={show}"
+                Point::new(if on { 187.0 } else { 184.0 }, 150.0),
+                "REGRESSION: ON keeps zero-travel paint priority; OFF retains the prior bounds-ruler result: on={on}, show={show}"
             );
             assert!(!review_597185_stroke_label(&actual.1));
             if !show {
@@ -2686,16 +2686,37 @@ fn review_599225_hidden_legacy_geometry_does_not_enable_bounds_ruler() {
     for show in [true, false] {
         for on in [false, true] {
             let actual = review_599225_body_move(60.0, Some(201.0), true, on, show, Some(203.0));
-            let expected = Point::new(if on { 193.0 } else { 190.0 }, 150.0);
+            let expected = Point::new(if on { 193.0 } else if show { 190.0 } else { 191.0 }, 150.0);
             assert!(
                 actual.0.distance(expected) < 1e-9,
-                "REGRESSION: the same zero-travel legacy bounds geometry gates ruler fallback regardless of its display: on={on}, show={show}, {actual:?}"
+                "REGRESSION: ON uses geometry; OFF retains the prior visibility-based ruler fallback: on={on}, show={show}, {actual:?}"
             );
             if !show {
                 assert!(actual.1.is_empty());
             } else {
                 assert_eq!(review_597185_stroke_label(&actual.1), on);
             }
+        }
+    }
+}
+
+/// #6595 keeps the prior snapping contract with the option off, including its zero-travel
+/// grabbed-point fallback and the display-dependent bounds-ruler fallback. These are ordinary
+/// ruler/geometry controls: adding an unreachable painted stroke must not change their OFF result.
+#[test]
+fn review_599403_option_off_retains_the_prior_constrained_ruler_path() {
+    for show in [true, false] {
+        for edge in [None, Some(202.0)] {
+            let zero = review_599225_body_move(57.0, Some(187.0), false, false, show, edge);
+            assert_eq!(zero.0, Point::new(184.0, 150.0), "OFF keeps the prior zero-grab bounds fallback: show={show}, edge={edge:?}");
+            assert!(!review_597185_stroke_label(&zero.1));
+            let held = review_599225_body_move(57.0, Some(186.0), false, false, show, edge);
+            assert_eq!(held.0, Point::new(186.0, 150.0), "CONTROL: the nonzero grabbed ruler still wins");
+        }
+        for edge in [None, Some(203.0)] {
+            let fallback = review_599225_body_move(60.0, Some(201.0), true, false, show, edge);
+            assert_eq!(fallback.0, Point::new(if show { 190.0 } else { 191.0 }, 150.0), "OFF keeps the prior displayed/hidden bounds fallback: show={show}, edge={edge:?}");
+            assert!(!review_597185_stroke_label(&fallback.1));
         }
     }
 }

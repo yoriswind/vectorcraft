@@ -86,6 +86,9 @@ struct Drag {
     /// when the Alt state at the release changes what it transforms.
     pointer: Point,
     shift: bool,
+    /// The pointer's own movement since the press, before snapping: a snapped press can turn a
+    /// level drag diagonal, so Scale's Shift-drag uses this to pick an axis (#6324).
+    moved: Vec2,
     last: Affine,
     /// The document revision at the press: a press whose document or selection changes before it
     /// becomes a drag is dropped, so its reference point is never applied to other objects.
@@ -97,6 +100,36 @@ impl Drag {
     /// transforms only pattern tiles (`patterns_only`, the backquote key) or not.
     fn angle_for(&self, copy: bool, patterns_only: bool) -> f64 {
         if self.anchors && !copy && !patterns_only { 0.0 } else { self.angle }
+    }
+}
+
+/// The pointer drag [`TransformTool::solve`] turns into a transform.
+struct SolveDrag {
+    start: Point,
+    p: Point,
+    /// The pointer's own movement since the press, before snapping (#6324).
+    moved: Vec2,
+    shift: bool,
+    bounds: Rect,
+}
+
+#[derive(Clone, Copy)]
+enum ScaleAxis {
+    X,
+    Y,
+}
+
+/// The Shift-axis rule, read from raw pointer motion. The solver and stroke contact search
+/// must use the same trajectory; a proposed painted contact must not choose a different axis.
+fn shift_scale_axis(from: Vec2, moved: Vec2) -> Option<ScaleAxis> {
+    let angle = moved.y.abs().atan2(moved.x.abs()).to_degrees();
+    let along = moved.hypot() > 1e-9;
+    if along && angle <= 22.5 && from.x.abs() > 1e-6 {
+        Some(ScaleAxis::X)
+    } else if along && angle >= 67.5 && from.y.abs() > 1e-6 {
+        Some(ScaleAxis::Y)
+    } else {
+        None
     }
 }
 
@@ -127,6 +160,11 @@ pub struct TransformTool {
     /// What the dragged pointer snaps to, gathered when the drag begins.
     snap: Option<PointSnap>,
     pick_snap: PickSnap,
+}
+
+/// The selected objects and ruler guides, which a reference point set by a click belongs to.
+fn selected_ids(cx: &ToolContext) -> Vec<NodeId> {
+    cx.selection.objects.iter().chain(&cx.selection.guides).copied().collect()
 }
 
 fn about(o: Point, a: Affine) -> Affine {
@@ -182,10 +220,11 @@ impl TransformTool {
     }
 
     /// The effective reference point: the custom one if it belongs to the current selection,
-    /// otherwise the centre of its bounding box (rotated with rotated objects).
+    /// otherwise the centre of its bounding box (rotated with rotated objects). With ruler guides
+    /// selected, it is the center of the objects' box and the guides' lines together.
     pub fn reference_point(&self, cx: &ToolContext) -> Option<Point> {
         if let Some((p, ids)) = &self.origin
-            && *ids == cx.selection.objects
+            && *ids == selected_ids(cx)
             && !ids.is_empty()
         {
             return Some(*p);
@@ -193,7 +232,29 @@ impl TransformTool {
         // Anchors selected with Direct Selection transform alone, about their own centre.
         vectorcraft_effects::preview::anchor_bounds_with(cx.selection, cx.doc, cx.bounds_measure())
             .map(|b| b.center())
-            .or_else(|| selection_box(cx).map(|b| b.center()))
+            .or_else(|| if self.guide_lines(cx).is_empty() { selection_box(cx).map(|b| b.center()) } else { self.bounds(cx).map(|b| b.center()) })
+    }
+
+    /// The selected ruler guides the tool transforms, as the boxes of the lines they stand for
+    /// ([`vectorcraft_doc::Document::guide_line`]): those that can be edited, with objects
+    /// selected, and with the Rotate tool also without.
+    fn guide_lines(&self, cx: &ToolContext) -> Vec<Rect> {
+        if cx.selection.is_empty() && self.kind != TransformKind::Rotate {
+            return vec![];
+        }
+        let d = cx.doc;
+        let guides = cx.selection.guides.iter().filter_map(|id| d.ruler_guide(*id)).filter(|g| d.guide_editable(g));
+        guides.filter_map(|g| d.guide_line(&g)).map(|(a, b)| Rect::from_points(a, b)).collect()
+    }
+
+    /// The bounding box of the selected objects and the lines of the guides the tool transforms.
+    fn bounds(&self, cx: &ToolContext) -> Option<Rect> {
+        self.guide_lines(cx).into_iter().fold(selection_bounds(cx), |acc, r| Some(acc.map_or(r, |acc| acc.union(r))))
+    }
+
+    /// Is there anything selected for the tool to transform?
+    fn has_target(&self, cx: &ToolContext) -> bool {
+        !cx.selection.is_empty() || !self.guide_lines(cx).is_empty()
     }
 
     /// Transform for dragging from `start` to `p` about `o`; returns the matrix and a readout.
@@ -206,7 +267,7 @@ impl TransformTool {
     /// and Shift's 45° steps start from the box's axes. A Reflect axis drawn by the drag is the
     /// line the pointer draws on the page.
     pub fn matrix_in(&self, angle: f64, o: Point, start: Point, p: Point, shift: bool, bounds: Rect) -> (Affine, String) {
-        let (m, a, b) = self.solve(angle, o, start, p, shift, bounds);
+        let (m, a, b) = self.solve(angle, o, SolveDrag { start, p, moved: p - start, shift, bounds });
         (m, self.label(a, b))
     }
 
@@ -237,7 +298,8 @@ impl TransformTool {
     /// axis in degrees counter-clockwise (Reflect), the scale along the box's width and height
     /// (Scale), or the angle of the shear axis (0 horizontal, 90 vertical) and the shear angle as
     /// `object.shear` takes it (Shear).
-    fn solve(&self, angle: f64, o: Point, start: Point, p: Point, shift: bool, bounds: Rect) -> (Affine, f64, f64) {
+    fn solve(&self, angle: f64, o: Point, d: SolveDrag) -> (Affine, f64, f64) {
+        let SolveDrag { start, p, moved, shift, bounds } = d;
         let frame = OrientedBox { angle, rect: Rect::ZERO };
         let local = |v: Vec2| frame.to_doc().inverse() * v.to_point();
         match self.kind {
@@ -260,11 +322,22 @@ impl TransformTool {
                 let d1 = local(p - o).to_vec2();
                 let ratio = |a: f64, b: f64| if a.abs() > 1e-6 { b / a } else { 1.0 };
                 let (mut sx, mut sy) = (ratio(d0.x, d1.x), ratio(d0.y, d1.y));
+                // Shift: a drag within 22.5° of an axis scales along that axis alone, a diagonal
+                // one uniformly (#6324). The pointer's own movement decides, in the box's axes; a
+                // snapped press can otherwise turn a level drag diagonal. A drag that starts level
+                // with the reference point on that axis has nothing to scale it by, so it stays uniform.
+                let moved_local = local(moved).to_vec2();
                 if shift {
-                    let l2 = d0.hypot2();
-                    let k = if l2 > 1e-12 { d1.dot(d0) / l2 } else { 1.0 };
-                    sx = k;
-                    sy = k;
+                    match shift_scale_axis(d0, moved_local) {
+                        Some(ScaleAxis::X) => sy = 1.0,
+                        Some(ScaleAxis::Y) => sx = 1.0,
+                        None => {
+                            let l2 = d0.hypot2();
+                            let k = if l2 > 1e-12 { d1.dot(d0) / l2 } else { 1.0 };
+                            sx = k;
+                            sy = k;
+                        }
+                    }
                 }
                 let clamp = |s: f64| if s.abs() < 1e-4 { 1e-4f64.copysign(s) } else { s };
                 let (sx, sy) = (clamp(sx), clamp(sy));
@@ -324,11 +397,16 @@ impl TransformTool {
             ev.pos,
             || {
                 let direction = d.pick - d.origin;
-                if ev.mods.shift {
-                    return Some(direction);
-                }
                 let frame = OrientedBox { angle, rect: Rect::ZERO }.to_doc();
                 let local = frame.inverse() * direction.to_point();
+                if ev.mods.shift {
+                    let moved = frame.inverse() * (ev.pos - d.start).to_point();
+                    return Some(match shift_scale_axis(local.to_vec2(), moved.to_vec2()) {
+                        Some(ScaleAxis::X) => (frame * Point::new(1.0, 0.0)).to_vec2(),
+                        Some(ScaleAxis::Y) => (frame * Point::new(0.0, 1.0)).to_vec2(),
+                        None => direction,
+                    });
+                }
                 match (local.x.abs() <= 1e-6, local.y.abs() <= 1e-6) {
                     (true, true) => Some(Vec2::ZERO),
                     (true, false) => Some((frame * Point::new(0.0, 1.0)).to_vec2()),
@@ -340,7 +418,7 @@ impl TransformTool {
                 let frame = OrientedBox { angle, rect: Rect::ZERO }.to_doc();
                 let to_local = frame.inverse() * Affine::translate(-d.origin.to_vec2());
                 let from = frame.inverse() * (d.pick - d.origin).to_point();
-                // Shift replaces the independent ratios with one projected factor.
+                // Shift uses one axis or a projected uniform factor, as the solver does.
                 // A fixed solver has no supplemental interval to search.
                 if ev.mods.shift && from.to_vec2().hypot2() <= 1e-12 {
                     return None;
@@ -363,7 +441,7 @@ impl TransformTool {
                     .collect();
                 Some(ContactDomain { to_local, regions })
             },
-            |p| self.solve(angle, d.origin, d.pick, p, ev.mods.shift, d.bounds).0 * d.pick,
+            |p| self.solve(angle, d.origin, SolveDrag { start: d.pick, p, moved: ev.pos - d.start, shift: ev.mods.shift, bounds: d.bounds }).0 * d.pick,
         )
     }
 
@@ -398,7 +476,7 @@ impl Tool for TransformTool {
         let p = ev.pos;
         match ev.kind {
             PointerKind::Down => {
-                let Some(bounds) = selection_bounds(cx) else { return vec![] };
+                let Some(bounds) = self.bounds(cx) else { return vec![] };
                 self.hover.clear();
                 let (pick, _) = self.pick_snap.snap(cx, p);
                 // Alt: decided on release. A click sets the point and opens the dialog; a drag
@@ -419,6 +497,7 @@ impl Tool for TransformTool {
                     anchors,
                     pointer: p,
                     shift: false,
+                    moved: Vec2::ZERO,
                     last: Affine::IDENTITY,
                     revision: cx.revision,
                 });
@@ -445,10 +524,15 @@ impl Tool for TransformTool {
                         Some(if self.kind == TransformKind::Scale { PointSnap::scaling(cx, targets) } else { PointSnap::moving(cx, targets) });
                     out.push(Action::Begin(self.kind.label().into()));
                 }
+                let moved = p - d.start;
                 let (p, guides) = self.snap_pointer(cx, d, ev);
                 self.hover = guides;
-                let (m, a, b) = self.solve(d.angle_for(ev.mods.alt, ev.backquote), d.origin, d.pick, p, ev.mods.shift, d.bounds);
-                (d.last, d.pointer, d.shift) = (m, p, ev.mods.shift);
+                let (m, a, b) = self.solve(
+                    d.angle_for(ev.mods.alt, ev.backquote),
+                    d.origin,
+                    SolveDrag { start: d.pick, p, moved, shift: ev.mods.shift, bounds: d.bounds },
+                );
+                (d.last, d.pointer, d.shift, d.moved) = (m, p, ev.mods.shift, moved);
                 self.drag = Some(d);
                 self.measure = Some((p, self.label(a, b)));
                 self.readout = Some(self.readout_of(m, a, b, d.bounds));
@@ -462,7 +546,12 @@ impl Tool for TransformTool {
                     // or moves only pattern tiles, and with anchors selected, whether it acts
                     // along the box or the page.
                     let m = if d.anchors {
-                        self.matrix_in(d.angle_for(ev.mods.alt, ev.backquote), d.origin, d.pick, d.pointer, d.shift, d.bounds).0
+                        self.solve(
+                            d.angle_for(ev.mods.alt, ev.backquote),
+                            d.origin,
+                            SolveDrag { start: d.pick, p: d.pointer, moved: d.moved, shift: d.shift, bounds: d.bounds },
+                        )
+                        .0
                     } else {
                         d.last
                     };
@@ -484,12 +573,16 @@ impl Tool for TransformTool {
                     }
                     self.drop_axis();
                     let copy = ev.mods.alt;
-                    let (m, _, _) = self.solve(d.angle_for(copy, ev.backquote), first, first, d.pick, false, d.bounds);
+                    let (m, _, _) = self.solve(
+                        d.angle_for(copy, ev.backquote),
+                        first,
+                        SolveDrag { start: first, p: d.pick, moved: d.pick - first, shift: false, bounds: d.bounds },
+                    );
                     vec![Action::Begin(self.kind.label().into()), preview(m, copy, ev.backquote), Action::Commit]
                 } else {
                     // A click sets the reference point; with Alt, it opens the dialog too. With the
                     // Reflect tool, a plain click also sets the first point of an axis.
-                    self.origin = Some((d.pick, cx.selection.objects.clone()));
+                    self.origin = Some((d.pick, selected_ids(cx)));
                     self.drop_axis();
                     if d.alt {
                         vec![self.dialog(d.pick)]
@@ -517,7 +610,7 @@ impl Tool for TransformTool {
             PointerKind::TripleClick => vec![],
             PointerKind::Move => {
                 if self.drag.is_none() {
-                    let (pick, hover) = if cx.selection.is_empty() { (p, vec![]) } else { self.pick_snap.snap(cx, p) };
+                    let (pick, hover) = if self.has_target(cx) { self.pick_snap.snap(cx, p) } else { (p, vec![]) };
                     self.hover = hover;
                     self.axis_to = self.axis_first(cx).map(|_| pick);
                 }
@@ -592,7 +685,7 @@ impl Tool for TransformTool {
     }
 
     fn cursor(&self, cx: &ToolContext, _p: Point, _m: Mods) -> Cursor {
-        if cx.selection.is_empty() {
+        if !self.has_target(cx) {
             return Cursor::NotAllowed;
         }
         match self.kind {
@@ -724,6 +817,35 @@ mod tests {
         assert_eq!(up.last(), Some(&Action::Commit));
     }
 
+    /// With only a ruler guide selected, the Rotate tool drags about the middle of the guide's
+    /// line, and Alt-click opens its dialog; the Scale tool still needs objects.
+    #[test]
+    fn the_rotate_tool_turns_a_selected_ruler_guide_alone() {
+        let mut d = vectorcraft_doc::Document::new(500.0, 500.0);
+        let g = d.add_ruler_guide(&vectorcraft_doc::Guide::new(true, 100.0));
+        let mut s = Selection::default();
+        s.guides.push(g);
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let mut t = TransformTool::new(TransformKind::Rotate);
+        assert_eq!(t.reference_point(&cx), Some(Point::new(100.0, 250.0)));
+        assert_ne!(t.cursor(&cx, Point::ZERO, Mods::default()), Cursor::NotAllowed);
+        assert!(t.pointer(&cx, &ev(PointerKind::Down, 200.0, 250.0)).is_empty());
+        let a = t.pointer(&cx, &ev(PointerKind::Drag, 100.0, 350.0));
+        assert_eq!(a[0], Action::Begin("Rotate".into()));
+        let m = matrix(&a[1]);
+        assert!((m * Point::new(100.0, 250.0)).distance(Point::new(100.0, 250.0)) < 1e-9);
+        assert!((m * Point::new(200.0, 250.0)).distance(Point::new(100.0, 350.0)) < 1e-9);
+        assert_eq!(t.pointer(&cx, &ev(PointerKind::Up, 100.0, 350.0)).last(), Some(&Action::Commit));
+        t.pointer(&cx, &ev(PointerKind::Down, 50.0, 60.0).with_mods(alt()));
+        let up = t.pointer(&cx, &ev(PointerKind::Up, 50.0, 60.0).with_mods(alt()));
+        assert!(matches!(up.as_slice(), [Action::Dialog(id, _)] if id == "rotate"), "{up:?}");
+        let mut scale = TransformTool::new(TransformKind::Scale);
+        assert_eq!(scale.reference_point(&cx), None);
+        assert!(scale.pointer(&cx, &ev(PointerKind::Down, 200.0, 250.0)).is_empty());
+        assert!(scale.pointer(&cx, &ev(PointerKind::Drag, 100.0, 350.0)).is_empty());
+    }
+
     #[test]
     fn click_sets_reference_point_then_drag_uses_it() {
         let (d, id) = doc_with_rect();
@@ -749,6 +871,54 @@ mod tests {
         let (m, _) = t.matrix_for(Point::new(150.0, 150.0), Point::new(200.0, 200.0), Point::new(250.0, 240.0), true, Rect::ZERO);
         let c = m.as_coeffs();
         assert!((c[0] - c[3]).abs() < 1e-9 && c[0] > 1.0);
+    }
+
+    /// A Shift-drag along one axis scales along that axis alone, and a diagonal one scales
+    /// uniformly (#6324): the drag's own direction decides, within 22.5° of an axis.
+    #[test]
+    fn scale_shift_follows_the_drag_direction() {
+        let t = TransformTool::new(TransformKind::Scale);
+        let o = Point::new(100.0, 100.0);
+        let scales = |p: Point| {
+            let c = t.matrix_for(o, Point::new(150.0, 140.0), p, true, Rect::ZERO).0.as_coeffs();
+            (c[0], c[3])
+        };
+        // Sideways, a little off the level: width only.
+        let (sx, sy) = scales(Point::new(200.0, 145.0));
+        assert!((sx - 2.0).abs() < 1e-9 && (sy - 1.0).abs() < 1e-9, "{sx} {sy}");
+        // Up or down: height only.
+        let (sx, sy) = scales(Point::new(148.0, 180.0));
+        assert!((sx - 1.0).abs() < 1e-9 && (sy - 2.0).abs() < 1e-9, "{sx} {sy}");
+        // Diagonal: both, by the same factor.
+        let (sx, sy) = scales(Point::new(200.0, 180.0));
+        assert!((sx - sy).abs() < 1e-9 && sx > 1.0, "{sx} {sy}");
+        // A drag that starts straight above (beside) the reference point has no width (height) to
+        // scale, so a sideways (up or down) Shift-drag from there scales uniformly, as before.
+        let from = |start: Point, p: Point| {
+            let c = t.matrix_for(o, start, p, true, Rect::ZERO).0.as_coeffs();
+            (c[0], c[3])
+        };
+        let (sx, sy) = from(Point::new(100.0, 150.0), Point::new(150.0, 160.0));
+        assert!((sx - sy).abs() < 1e-9 && (sx - 1.2).abs() < 1e-9, "{sx} {sy}");
+        let (sx, sy) = from(Point::new(150.0, 100.0), Point::new(160.0, 150.0));
+        assert!((sx - sy).abs() < 1e-9 && (sx - 1.2).abs() < 1e-9, "{sx} {sy}");
+    }
+
+    /// The axis of a Shift-drag comes from the pointer's own movement: a press near a corner
+    /// snaps to it, and a level drag from there still scales the width alone.
+    #[test]
+    fn scale_shift_axis_follows_the_pointer_not_the_snapped_press() {
+        let (d, id) = doc_with_rect();
+        let mut s = Selection::default();
+        s.add(id);
+        let p = paint();
+        let cx = cx(&d, &s, &p);
+        let shift = Mods { shift: true, ..Default::default() };
+        let mut t = TransformTool::new(TransformKind::Scale);
+        t.pointer(&cx, &ev(PointerKind::Down, 198.0, 203.0).with_mods(shift));
+        let drag = t.pointer(&cx, &ev(PointerKind::Drag, 205.0, 203.0).with_mods(shift));
+        let c = matrix(drag.last().expect("a preview")).as_coeffs();
+        assert!((c[0] - 1.1).abs() < 1e-9 && (c[3] - 1.0).abs() < 1e-9, "the width alone: {c:?}");
     }
 
     #[test]

@@ -3,10 +3,13 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Shape, vec2};
-use serde_json::json;
+use craft::ui::runtime::frame::take_output;
+use craft::ui::shell::embed;
+use egui::accesskit::{Node, Role};
+use egui::{Event, Modifiers, PointerButton, Pos2, RawInput, Rect, vec2};
+use serde_json::{Value, json};
 use vectorcraft_engine::{Prefs, Session};
-use vectorcraft_ui_egui::{UiState, VectorcraftApp, i18n, prefs_dialog, theme};
+use vectorcraft_ui_egui::{UiState, VectorcraftApp, control, i18n, prefs_dialog};
 
 const KEY: &str = "snapToStrokeEdges";
 const LABEL: &str = "Snap to Stroke Edges";
@@ -32,25 +35,11 @@ impl Drop for Language {
     }
 }
 
-fn text_points(shape: &Shape, clip: Rect, out: &mut Vec<(String, Pos2)>) {
-    match shape {
-        Shape::Text(text) => {
-            let point = text.pos + vec2(4.0, 6.0);
-            if clip.contains(point) {
-                out.push((text.galley.text().to_owned(), point));
-            }
-        }
-        Shape::Vec(children) => children.iter().for_each(|shape| text_points(shape, clip, out)),
-        _ => {}
-    }
-}
-
 struct Scene {
     app: VectorcraftApp,
     ctx: egui::Context,
     time: f64,
-    shown: Vec<(String, Pos2)>,
-    nodes: Vec<egui::accesskit::Node>,
+    nodes: Vec<Node>,
 }
 
 impl Scene {
@@ -63,9 +52,9 @@ impl Scene {
         app.select_tool("selection");
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
-        theme::install_fonts(&ctx);
-        theme::apply(&ctx, Default::default());
-        let mut s = Self { app, ctx, time: 0.0, shown: vec![], nodes: vec![] };
+        embed::install(&ctx, craft::ui::testing::install_spec(), &vectorcraft_ui_egui::ui_fonts()).unwrap();
+        app.adopt_context(&ctx);
+        let mut s = Self { app, ctx, time: 0.0, nodes: vec![] };
         s.settle();
         s.app.take_prefs_changed();
         s
@@ -80,12 +69,13 @@ impl Scene {
             focused: true,
             ..Default::default()
         };
-        self.app.raw_input_hook(&self.ctx, &mut raw);
-        let mut output = self.ctx.run_ui(raw, |ui| self.app.ui(ui));
-        self.shown.clear();
-        for clipped in &output.shapes {
-            text_points(&clipped.shape, clipped.clip_rect, &mut self.shown);
-        }
+        self.app.raw_input(&self.ctx, &mut raw);
+        embed::before_input(&self.ctx, |out| self.app.frame_input(out));
+        let mut output = self.ctx.run_ui(raw, |ui| {
+            self.app.tick(ui.ctx());
+            self.app.ui(ui);
+        });
+        let _ = self.app.frame_input(take_output(&self.ctx));
         self.nodes =
             output.platform_output.accesskit_update.take().map(|update| update.nodes.into_iter().map(|(_, node)| node).collect()).unwrap_or_default();
         output.textures_delta.clear();
@@ -97,20 +87,32 @@ impl Scene {
         }
     }
 
-    fn points(&self, label: &str, foreground: bool) -> Vec<Pos2> {
-        self.shown
-            .iter()
-            .filter(|(text, point)| {
-                text == label && (!foreground || self.ctx.layer_id_at(*point).is_some_and(|layer| layer.order == egui::Order::Foreground))
-            })
-            .map(|(_, point)| *point)
-            .collect()
+    fn rect(node: &Node) -> Option<Rect> {
+        let bounds = node.bounds()?;
+        Some(Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32)))
     }
 
-    fn point(&self, label: &str, foreground: bool) -> Pos2 {
-        let points = self.points(label, foreground);
-        assert_eq!(points.len(), 1, "one painted {label:?} in its expected UI context; found {points:?}");
-        points[0]
+    fn button(&self, label: &str) -> Pos2 {
+        let nodes: Vec<_> = self.nodes.iter().filter(|n| n.role() == Role::Button && n.label() == Some(label)).filter_map(Self::rect).collect();
+        assert_eq!(nodes.len(), 1, "one actual native button {label:?}");
+        nodes[0].center()
+    }
+
+    fn dialog(&self) -> Value {
+        control::inspect(&self.app, &self.ctx)["ui"]["dialog"].clone()
+    }
+
+    fn draft(&self) -> bool {
+        self.dialog()["fields"][KEY].as_bool().expect("the existing Preferences draft field")
+    }
+
+    fn toggle(&self, role: Role) -> Option<&Node> {
+        self.nodes.iter().find(|n| n.role() == role && n.label() == Some(LABEL)
+            && Self::rect(n).is_some_and(|r| r.is_positive() && self.ctx.content_rect().contains(r.center())))
+    }
+
+    fn menu_open(&self) -> bool {
+        self.toggle(Role::MenuItemCheckBox).is_some()
     }
 
     fn click(&mut self, pos: Pos2) {
@@ -127,50 +129,54 @@ impl Scene {
     fn open_preferences(&mut self) {
         self.app.run("edit.preferences", json!({"category": "Smart Guides"})).unwrap();
         self.settle();
-        let dialog = self.app.ui.dialog.as_ref().unwrap();
-        assert_eq!(dialog.kind, "preferences");
-        assert_eq!(dialog.str("__category"), "Smart Guides");
-        assert_eq!(self.points("Preferences", true).len(), 1);
-        // Scroll the real settings column if the new Geometric Guides row is below its viewport.
-        if self.points(LABEL, true).is_empty() {
-            let in_fields = self.point("Alignment Guides", true);
+        let dialog = self.dialog();
+        assert_eq!(dialog["kind"], "preferences");
+        assert_eq!(dialog["fields"]["__category"], "Smart Guides");
+        assert!(self.nodes.iter().any(|node| matches!(node.role(), Role::Dialog | Role::Window) && node.label() == Some("Preferences")),
+            "the native Preferences window is drawn");
+        // Scroll the actual settings column if Geometric Guides is below its viewport.
+        if self.toggle(Role::CheckBox).is_none() {
+            let in_fields = self.nodes.iter().find(|n| n.role() == Role::CheckBox && n.label() == Some("Alignment Guides"))
+                .and_then(Self::rect).expect("the actual Alignment Guides control").center();
             for _ in 0..8 {
-                self.frame(vec![
-                    Event::PointerMoved(in_fields),
-                    Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: vec2(0.0, -120.0),
-                        phase: egui::TouchPhase::Move,
-                        source: egui::MouseWheelSource::Unknown,
-                        modifiers: Modifiers::NONE,
-                    },
-                ]);
-                for _ in 0..10 {
-                    self.frame(vec![]);
-                }
-                if !self.points(LABEL, true).is_empty() {
-                    break;
-                }
+                self.frame(vec![Event::PointerMoved(in_fields), Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -120.0), phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown, modifiers: Modifiers::NONE,
+                }]);
+                for _ in 0..10 { self.frame(vec![]); }
+                if self.toggle(Role::CheckBox).is_some() { break; }
             }
         }
         self.checkbox_point();
     }
 
     fn checkbox_point(&self) -> Pos2 {
-        let point = self.point(LABEL, true);
-        let nodes: Vec<_> = self.nodes.iter().filter(|node| node.role() == egui::accesskit::Role::CheckBox && node.label() == Some(LABEL)).collect();
-        assert_eq!(nodes.len(), 1, "the painted label must belong to one actual checkbox response");
-        let bounds = nodes[0].bounds().expect("actual checkbox has accessible response bounds");
-        let rect = Rect::from_min_max(egui::pos2(bounds.x0 as f32, bounds.y0 as f32), egui::pos2(bounds.x1 as f32, bounds.y1 as f32));
-        assert!(rect.contains(point), "painted label click {point:?} must hit actual checkbox response {rect:?}");
-        point
+        let node = self.toggle(Role::CheckBox).expect("the visible native Preferences checkbox");
+        assert!(!node.is_disabled());
+        Self::rect(node).unwrap().center()
+    }
+
+    fn menu_point(&self) -> Pos2 {
+        assert!(self.menu_open(), "the native Snapping menu is open");
+        let node = self.toggle(Role::MenuItemCheckBox).expect("the actual native checked menu row");
+        assert!(!node.is_disabled());
+        Self::rect(node).unwrap().center()
+    }
+
+    fn assert_toggle_value(&self, role: Role, expected: bool) {
+        let node = self.toggle(role).expect("the real toggle response is visible");
+        let expected = if expected { egui::accesskit::Toggled::True } else { egui::accesskit::Toggled::False };
+        assert_eq!(node.toggled(), Some(expected), "the actual native control exposes its displayed value");
     }
 
     fn assert_checkbox_value(&self, expected: bool) {
         self.checkbox_point();
-        let node = self.nodes.iter().find(|node| node.role() == egui::accesskit::Role::CheckBox && node.label() == Some(LABEL)).unwrap();
-        let expected = if expected { egui::accesskit::Toggled::True } else { egui::accesskit::Toggled::False };
-        assert_eq!(node.toggled(), Some(expected), "the actual checkbox response exposes the displayed value");
+        self.assert_toggle_value(Role::CheckBox, expected);
+    }
+
+    fn assert_menu_value(&self, expected: bool) {
+        self.menu_point();
+        self.assert_toggle_value(Role::MenuItemCheckBox, expected);
     }
 }
 
@@ -235,27 +241,27 @@ fn stroke_edge_preferences_painted_smart_guides_checkbox_is_draft_until_ok() {
     let state = s.app.session.active().unwrap();
     let (document, selection, history) = (state.doc.clone(), state.selection.clone(), (state.history.undo.len(), state.history.redo.len()));
     s.open_preferences();
-    assert!(!s.app.ui.dialog.as_ref().unwrap().bool(KEY));
+    assert!(!s.draft());
     s.assert_checkbox_value(false);
     s.click(s.checkbox_point());
-    assert!(s.app.ui.dialog.as_ref().unwrap().bool(KEY), "actual checkbox changes the dialog draft");
+    assert!(s.draft(), "actual checkbox changes the dialog draft");
     assert!(!s.value(), "draft is not a live tool preference");
     assert!(!s.app.take_prefs_changed());
-    s.click(s.point("Cancel", true));
-    assert!(s.app.ui.dialog.is_none());
+    s.click(s.button("Cancel"));
+    assert!(s.dialog().is_null());
     assert!(!s.value());
     assert!(!s.app.take_prefs_changed());
     s.open_preferences();
-    assert!(!s.app.ui.dialog.as_ref().unwrap().bool(KEY), "Cancel discarded the changed draft");
+    assert!(!s.draft(), "Cancel discarded the changed draft");
     s.click(s.checkbox_point());
-    s.click(s.point("OK", true));
-    assert!(s.app.ui.dialog.is_none());
+    s.click(s.button("OK"));
+    assert!(s.dialog().is_null());
     assert!(s.value(), "OK applies the same engine preference");
     assert!(s.app.take_prefs_changed());
     s.open_preferences();
-    assert!(s.app.ui.dialog.as_ref().unwrap().bool(KEY), "reopening reads the applied value");
+    assert!(s.draft(), "reopening reads the applied value");
     s.assert_checkbox_value(true);
-    s.click(s.point("Cancel", true));
+    s.click(s.button("Cancel"));
     let state = s.app.session.active().unwrap();
     assert_eq!(state.doc, document);
     assert_eq!(state.selection, selection);
@@ -272,10 +278,10 @@ fn stroke_edge_preferences_control_bar_snapping_click_and_preferences_share_the_
     let state = s.app.session.active().unwrap();
     let (document, selection, history) = (state.doc.clone(), state.selection.clone(), (state.history.undo.len(), state.history.redo.len()));
     assert!(!s.value());
-    s.click(s.point("Snapping", false));
-    assert!(s.app.ui.dialog.is_none(), "this checkbox is in the real Control bar popup");
-    s.assert_checkbox_value(false);
-    s.click(s.checkbox_point());
+    s.click(s.button("Snapping"));
+    assert!(s.dialog().is_null(), "this checkbox is in the real Control bar popup");
+    s.assert_menu_value(false);
+    s.click(s.menu_point());
     assert!(s.value(), "actual popup checkbox applies the shared preference immediately");
     // The host's debounced save snapshots Session prefs; this menu route need not set the
     // immediate Preferences-confirmation flag. Exercise the existing public equivalent.
@@ -286,19 +292,19 @@ fn stroke_edge_preferences_control_bar_snapping_click_and_preferences_share_the_
     prefs_dialog::restore(&mut reopened);
     assert_eq!(reopened.run("prefs.get", json!({"key": KEY})).unwrap(), true, "the actual popup change survives the host snapshot/restore path");
     // Dismiss the menu normally before opening the other UI surface.
-    if !s.points(LABEL, true).is_empty() {
-        s.click(s.point("Snapping", false));
+    if s.menu_open() {
+        s.click(s.button("Snapping"));
     }
     s.open_preferences();
-    assert!(s.app.ui.dialog.as_ref().unwrap().bool(KEY));
+    assert!(s.draft());
     s.assert_checkbox_value(true);
     s.click(s.checkbox_point());
     assert!(s.value(), "the reverse change stays a draft until OK");
-    s.click(s.point("OK", true));
+    s.click(s.button("OK"));
     assert!(!s.value());
     assert!(s.app.take_prefs_changed());
-    s.click(s.point("Snapping", false));
-    s.assert_checkbox_value(false);
+    s.click(s.button("Snapping"));
+    s.assert_menu_value(false);
     assert!(!s.value(), "reopened Snapping popup reads the value applied by Preferences");
     let state = s.app.session.active().unwrap();
     assert_eq!(state.doc, document);
