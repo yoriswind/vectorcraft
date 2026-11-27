@@ -293,6 +293,26 @@ fn linked_palette_colors(d: &Document, palette: &Palette) -> BTreeMap<String, Co
         .collect()
 }
 
+/// Refresh the cached appearance of a stop which still prints process plates beside its spot ink.
+/// The CMYK alternate mixes the same ink coverages as DeviceN output and `Separated::composite`:
+/// each channel is `1 - (1 - process) * (1 - spot_tint * spot_alternate)`. Links, tints and plates
+/// stay authoritative; this only refreshes their display cache in the document's assigned profiles.
+fn refresh_plated_stops(paint: &mut Paint, alternates: &BTreeMap<String, [f32; 4]>) -> bool {
+    let Paint::Gradient(g) = paint else { return false };
+    let amount = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+    let mut changed = false;
+    for stop in &mut g.gradient.stops {
+        let Some(plates) = stop.plates else { continue };
+        let Some(ink) = stop.swatch.as_deref().and_then(|name| alternates.get(name)) else { continue };
+        let tint = amount(stop.tint);
+        let mixed: [f32; 4] = std::array::from_fn(|i| 1.0 - (1.0 - amount(plates[i])) * (1.0 - tint * amount(ink[i])));
+        let color = Color::cmyk(mixed[0], mixed[1], mixed[2], mixed[3]);
+        changed |= stop.color != color;
+        stop.color = color;
+    }
+    changed
+}
+
 /// Refresh existing profile resources against their replacement palette, while keeping the
 /// palette's own raw Color values separate for final restoration.
 fn refresh_references(d: &mut Document, palette: &Palette) -> Result<()> {
@@ -301,6 +321,16 @@ fn refresh_references(d: &mut Document, palette: &Palette) -> Result<()> {
     if let Some(color) = d.global_color(registration) {
         colors.insert(registration.into(), color);
     }
+    let cms = cms::active();
+    let intent = cms.settings().intent;
+    let alternates: BTreeMap<String, [f32; 4]> = colors.iter().filter_map(|(name, base)| {
+        // Use the canonical separator to identify actual spot links (including the special case
+        // of a spot named Cyan/Magenta/Yellow/Black); a process or shadowed swatch is not a spot.
+        let ink = vectorcraft_doc::inks::stop_inks(d, &cms, base, Some((name, 1.0)), None, intent);
+        ink.spot.as_ref()?;
+        let equivalent = if cms::PROCESS_PLATES.contains(&name.as_str()) { ink.cmyk } else { cms.to_cmyk(base, intent) };
+        Some((name.clone(), equivalent))
+    }).collect();
     let mut color_link = |color: &mut Color, link: &mut Option<String>, tint: &mut f32| {
         let Some(name) = link.as_deref() else { return false };
         match colors.get(name) {
@@ -324,6 +354,7 @@ fn refresh_references(d: &mut Document, palette: &Palette) -> Result<()> {
             let mut expected = Paint::Gradient(Box::new(GradientPaint::new(gradient.gradient.clone())));
             // Cached linked-stop colors must use the same document context as the art.
             expected.map_links(&mut color_link);
+            refresh_plated_stops(&mut expected, &alternates);
             match expected {
                 Paint::Gradient(gradient) => Some(gradient.gradient),
                 _ => None,
@@ -332,6 +363,7 @@ fn refresh_references(d: &mut Document, palette: &Palette) -> Result<()> {
     }
     let mut gradient_source = |paint: &Paint| {
         let mut next = paint.clone();
+        let mut changed = refresh_plated_stops(&mut next, &alternates);
         if let Paint::Gradient(g) = &mut next
             && g.swatch.as_ref().is_some_and(|name| {
                 let Some(Some(expected)) = gradients.get(name) else { return true };
@@ -344,10 +376,9 @@ fn refresh_references(d: &mut Document, palette: &Palette) -> Result<()> {
             })
         {
             g.swatch = None;
-            Some(next)
-        } else {
-            None
+            changed = true;
         }
+        changed.then_some(next)
     };
     // This existing walker also keeps a Hue Shift brush's colorization key in step with its art.
     super::swatch::map_swatch_links(d, &mut color_link);
@@ -472,4 +503,78 @@ mod tests {
         assert!(error.contains("1048576 encoded bytes") && error.contains("previous default palette was kept"), "{error}");
         assert_eq!(s.prefs.to_json(), previous, "encoded-limit rejection preserves the previous successful choice");
     }
+
+    #[test]
+    fn review_4618109692_refresh_keeps_spot_and_process_plates_in_one_display_mix() {
+        if !crate::tests::in_own_process("cmd::swatchdefaults::tests::review_4618109692_refresh_keeps_spot_and_process_plates_in_one_display_mix") {
+            return;
+        }
+        use vectorcraft_color::{GradientKind, GradientStop};
+        use vectorcraft_doc::separated::{InkPlate, Separated};
+        use vectorcraft_doc::{GraphicStyle, TextStyleDef};
+
+        let mut d = Document::new(40.0, 30.0);
+        d.spot_use_lab = false;
+        d.color_profiles.cmyk = Some(cms::DEVICE_CMYK.into());
+        let _profiles = ProfileScope::enter(&d);
+        let base = Color::cmyk(0.8, 0.25, 0.0, 0.1);
+        let tint = 128.0 / 255.0;
+        let plates = [51.0 / 255.0, 0.0, 102.0 / 255.0, 0.0];
+        let mut stop = GradientStop::new(0.0, Color::rgb8(255, 0, 255));
+        stop.swatch = Some("Brand".into());
+        stop.tint = tint;
+        stop.plates = Some(plates);
+        let mut plain = GradientStop::new(1.0, Color::rgb8(255, 0, 255));
+        plain.swatch = Some("Brand".into());
+        plain.tint = tint;
+        let gradient = Gradient::new(GradientKind::Linear, vec![stop, plain]);
+        let palette_paint = Paint::Gradient(Box::new(GradientPaint::new(gradient.clone())));
+        d.swatches = vec![
+            Swatch { name: "Brand".into(), paint: Paint::solid(base), global: true, spot: true },
+            Swatch { name: "Brand ramp".into(), paint: palette_paint, global: false, spot: false },
+        ].into();
+        let mut resource = GradientPaint::new(gradient);
+        resource.swatch = Some("Brand ramp".into());
+        let resource = Paint::Gradient(Box::new(resource));
+        d.graphic_styles.push(GraphicStyle::new("Plated resource", Appearance::basic(resource.clone(), Paint::None, 0.0)));
+        for styles in [&mut d.char_styles, &mut d.para_styles] {
+            styles.push(TextStyleDef { name: "Plated text".into(), attrs: json!({"fill": resource}).as_object().unwrap().clone() });
+        }
+        let palette = Palette::of(&d);
+        refresh_references(&mut d, &palette).unwrap();
+        let Paint::Gradient(cached) = &d.swatch("Brand ramp").unwrap().paint else { panic!("gradient") };
+        let refreshed = &cached.gradient.stops[0];
+        assert_eq!((refreshed.swatch.as_deref(), refreshed.tint, refreshed.plates), (Some("Brand"), tint, Some(plates)));
+        assert_ne!(refreshed.color, base.tinted(tint), "process ink must remain visible beside the spot tint");
+        let c = cms::active();
+        let ink = vectorcraft_doc::inks::stop_inks(&d, &c, &refreshed.color, Some(("Brand", tint)), refreshed.plates, c.settings().intent);
+        assert_eq!(ink.cmyk, plates, "refresh preserves the exact process separation amounts");
+        assert_eq!(ink.spot, Some(("Brand".into(), tint)), "refresh preserves the spot plate and its tint");
+        // Independent existing separated-image compositor: the same physical plate mix, quantized to one pixel.
+        let equivalent = c.to_cmyk(&base, c.settings().intent);
+        let separated = Separated::new(1, 1, vec![
+            InkPlate { name: "Cyan".into(), cmyk: [1.0, 0.0, 0.0, 0.0], data: vec![51] },
+            InkPlate { name: "Yellow".into(), cmyk: [0.0, 0.0, 1.0, 0.0], data: vec![102] },
+            InkPlate { name: "Brand".into(), cmyk: equivalent, data: vec![128] },
+        ]).unwrap().composite();
+        let Color::Cmyk { c, m, y, k } = refreshed.color else { panic!("mixed CMYK display cache") };
+        for (channel, byte) in [c, m, y, k].into_iter().zip(&separated.data) {
+            assert!((channel - f32::from(*byte) / 255.0).abs() <= 0.5 / 255.0 + 1e-6, "display uses the canonical ink composition");
+        }
+        assert_eq!(cached.gradient.stops[1].color, base.tinted(tint), "unplated stops retain ordinary linked tint behavior");
+        for styles in [&d.char_styles, &d.para_styles] {
+            let paint: Paint = serde_json::from_value(styles[0].attrs["fill"].clone()).unwrap();
+            let Paint::Gradient(g) = paint else { panic!("text gradient") };
+            assert_eq!(g.swatch.as_deref(), Some("Brand ramp"), "mixed stop refresh does not detach an otherwise matching gradient resource");
+            assert_eq!(g.gradient, cached.gradient);
+        }
+        let Some(vectorcraft_doc::AppearanceItem::Fill(fill)) = d.graphic_styles[0].appearance.items.first() else { panic!("style fill") };
+        let Paint::Gradient(g) = &fill.paint else { panic!("style gradient") };
+        assert_eq!(g.swatch.as_deref(), Some("Brand ramp"));
+        assert_eq!(g.gradient, cached.gradient, "graphic styles use the same mixed display cache as text resources");
+        let before = d.clone();
+        refresh_references(&mut d, &palette).unwrap();
+        assert_eq!(d, before, "refresh is idempotent and does not modify authoritative plate/link data");
+    }
+
 }
