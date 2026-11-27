@@ -578,7 +578,8 @@ mod tests {
             assert_eq!(g.swatch.as_deref(), Some("Brand ramp"), "mixed stop refresh does not detach an otherwise matching gradient resource");
             assert_eq!(g.gradient, cached.gradient);
         }
-        let Some(vectorcraft_doc::AppearanceItem::Fill(fill)) = d.graphic_styles[0].appearance.items.first() else { panic!("style fill") };
+        let style = d.graphic_styles.iter().find(|style| style.name == "Plated resource").expect("plated resource");
+        let Some(vectorcraft_doc::AppearanceItem::Fill(fill)) = style.appearance.items.first() else { panic!("style fill") };
         let Paint::Gradient(g) = &fill.paint else { panic!("style gradient") };
         assert_eq!(g.swatch.as_deref(), Some("Brand ramp"));
         assert_eq!(g.gradient, cached.gradient, "graphic styles use the same mixed display cache as text resources");
