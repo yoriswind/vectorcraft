@@ -363,9 +363,7 @@ pub(crate) fn adopt(dst: &mut Document, src: &Document, nodes: &mut [Node], cmd:
         &used.symbols,
         |n| src.symbols.iter().find(|s| s.name == n),
         |n| dst.symbols.iter().find(|s| s.name == n),
-        |existing, incoming| {
-            same_symbol(dst, existing, incoming) && SymbolOptions::of(dst, &existing.name) == SymbolOptions::of(src, &incoming.name)
-        },
+        |existing, incoming| same_symbol(dst, existing, incoming) && SymbolOptions::of(dst, &existing.name) == SymbolOptions::of(src, &incoming.name),
         |c| dst.symbols.iter().any(|s| s.name == c),
     );
     let mut patterns = names(&used.patterns, |n| src.pattern(n), |n| dst.pattern(n), |a, b| same_pattern(dst, a, b), |c| dst.pattern(c).is_some());

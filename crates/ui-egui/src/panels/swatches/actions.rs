@@ -200,7 +200,6 @@ pub(crate) fn menu_states(app: &VectorcraftApp, states: &mut CommandStates) {
     for (v, _) in View::ALL {
         states.set(view_ref(v), CommandState::new().checked(v == app.ui.swatches_view));
     }
-
 }
 
 /// Runs panel menu row `id` (`ui.swatches.<row>`); `None` for another panel's id.

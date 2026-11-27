@@ -1309,12 +1309,20 @@ mod review_597585_adoption_options {
             let mut destination = Session::new();
             destination.add_document(outer, None);
             match variant {
-                "pixel" => { destination.execute("symbol.options", &json!({"name": SYMBOL, "alignToPixelGrid": false})).unwrap(); }
-                "guides" => { destination.execute("symbol.options", &json!({"name": SYMBOL, "nineSliceGuides": [0.1, 0.2, 0.15, 0.25]})).unwrap(); }
+                "pixel" => {
+                    destination.execute("symbol.options", &json!({"name": SYMBOL, "alignToPixelGrid": false})).unwrap();
+                }
+                "guides" => {
+                    destination.execute("symbol.options", &json!({"name": SYMBOL, "nineSliceGuides": [0.1, 0.2, 0.15, 0.25]})).unwrap();
+                }
                 _ => {}
             }
             let mut outer = document(&destination).clone();
-            assert_eq!(outer.symbols.iter().find(|symbol| symbol.name == SYMBOL).unwrap(), &source_symbol, "CONTROL: the source and destination art are identical");
+            assert_eq!(
+                outer.symbols.iter().find(|symbol| symbol.name == SYMBOL).unwrap(),
+                &source_symbol,
+                "CONTROL: the source and destination art are identical"
+            );
             let old_options = review597585_options(&outer, SYMBOL);
             assert_eq!(old_options == expected, variant == "same", "CONTROL: only the requested document-level options differ");
             let old_user = Node::new(outer.alloc_id(), NodeKind::SymbolInstance { symbol: SYMBOL.into(), xf: Affine::IDENTITY });

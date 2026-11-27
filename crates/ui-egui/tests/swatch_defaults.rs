@@ -48,13 +48,19 @@ struct Panel {
 }
 
 impl Panel {
-    fn state(&self) -> Ref<'_, VectorcraftApp> { self.app.borrow() }
-    fn state_mut(&self) -> RefMut<'_, VectorcraftApp> { self.app.borrow_mut() }
+    fn state(&self) -> Ref<'_, VectorcraftApp> {
+        self.app.borrow()
+    }
+    fn state_mut(&self) -> RefMut<'_, VectorcraftApp> {
+        self.app.borrow_mut()
+    }
 
     fn input(&mut self) {
         let input = self.app.borrow_mut().frame_input(take_output(self.fixture.ctx()));
         self.fixture.root(input.root).commands(input.commands);
-        if let Some(host) = input.host { self.fixture.host(host); }
+        if let Some(host) = input.host {
+            self.fixture.host(host);
+        }
     }
 
     fn run_steps(&mut self, count: usize) {
@@ -66,8 +72,12 @@ impl Panel {
     }
 
     fn target(&self, role: Role, label: &str) -> Target {
-        self.fixture.by_role(role).into_iter().find(|t| self.fixture.tree().name_of(t.node) == Some(label))
-            .unwrap_or_else(|| panic!("missing {label:?} in {:?}", self.fixture.tree().keys().into_iter().filter_map(|k| self.fixture.tree().name_of(k)).collect::<Vec<_>>()))
+        self.fixture.by_role(role).into_iter().find(|t| self.fixture.tree().name_of(t.node) == Some(label)).unwrap_or_else(|| {
+            panic!(
+                "missing {label:?} in {:?}",
+                self.fixture.tree().keys().into_iter().filter_map(|k| self.fixture.tree().name_of(k)).collect::<Vec<_>>()
+            )
+        })
     }
 
     fn click_target(&mut self, target: Target) {
@@ -79,15 +89,24 @@ impl Panel {
     fn menu(&mut self) {
         self.run_steps(1);
         let tree = self.fixture.tree();
-        let menu = self.fixture.by_role(Role::BUTTON).into_iter().find(|target| {
-            if tree.name_of(target.node) != Some("Panel menu") { return false; }
-            let mut at = tree.parent_of_key(target.node);
-            while let Some(key) = at {
-                if tree.name_of(key).is_some_and(|name| name.contains("Swatches")) { return true; }
-                at = tree.parent_of_key(key);
-            }
-            false
-        }).expect("the actual Swatches dock owns a panel menu");
+        let menu = self
+            .fixture
+            .by_role(Role::BUTTON)
+            .into_iter()
+            .find(|target| {
+                if tree.name_of(target.node) != Some("Panel menu") {
+                    return false;
+                }
+                let mut at = tree.parent_of_key(target.node);
+                while let Some(key) = at {
+                    if tree.name_of(key).is_some_and(|name| name.contains("Swatches")) {
+                        return true;
+                    }
+                    at = tree.parent_of_key(key);
+                }
+                false
+            })
+            .expect("the actual Swatches dock owns a panel menu");
         self.click_target(menu);
     }
 }

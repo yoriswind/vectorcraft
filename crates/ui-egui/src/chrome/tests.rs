@@ -3261,14 +3261,18 @@ fn review_status_details_glyphs(shown: &mut Shown, text: &str) -> Vec<(char, egu
     shown.run_fired();
     let shapes = shown.fixture.frame_clipped_shapes();
     shown.run_fired();
-    shapes.iter().filter_map(|(clip, shape)| match shape {
-        egui::Shape::Text(run) if !run.galley.elided && run.galley.job.text == text => Some((run, *clip)),
-        _ => None,
-    }).flat_map(|(run, clip)| {
-        run.galley.rows.iter().flat_map(move |row| row.glyphs.iter().map(move |glyph| {
-            (glyph.chr, glyph.logical_rect().translate(run.pos.to_vec2() + row.pos.to_vec2()), clip)
-        }))
-    }).collect()
+    shapes
+        .iter()
+        .filter_map(|(clip, shape)| match shape {
+            egui::Shape::Text(run) if !run.galley.elided && run.galley.job.text == text => Some((run, *clip)),
+            _ => None,
+        })
+        .flat_map(|(run, clip)| {
+            run.galley.rows.iter().flat_map(move |row| {
+                row.glyphs.iter().map(move |glyph| (glyph.chr, glyph.logical_rect().translate(run.pos.to_vec2() + row.pos.to_vec2()), clip))
+            })
+        })
+        .collect()
 }
 
 fn review_status_details_tail(glyphs: &[(char, egui::Rect, egui::Rect)], tail: &str) -> Vec<(egui::Rect, egui::Rect)> {
@@ -3294,27 +3298,52 @@ fn review_status_details_scroll_to_tail(shown: &mut Shown, text: &str, tail: &st
     let glyphs = review_status_details_glyphs(shown, text);
     let tail = review_status_details_tail(&glyphs, tail);
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 300.0));
-    assert!(tail.iter().all(|(bounds, clip)| bounds.intersect(clip.intersect(screen)).is_positive()), "every glyph of the last filename/reason is visible inside the small-window clip");
-    assert!(shown.tree().keys().into_iter().any(|key| shown.tree().description_of(key) == Some(text)), "the native alert exposes every note/error in its complete accessible description");
+    assert!(
+        tail.iter().all(|(bounds, clip)| bounds.intersect(clip.intersect(screen)).is_positive()),
+        "every glyph of the last filename/reason is visible inside the small-window clip"
+    );
+    assert!(
+        shown.tree().keys().into_iter().any(|key| shown.tree().description_of(key) == Some(text)),
+        "the native alert exposes every note/error in its complete accessible description"
+    );
 }
 
 /// The compact hover stays a summary; the native link reaches every note without re-reporting it.
 #[test]
 fn review_4635935484_all_status_notes_are_reachable_by_click_and_wheel() {
     let mut shown = review_status_details_shown();
-    let notes: Vec<String> = (1..=100).map(|i| format!("queue file {i:03}.png: reason {i:03} — {}", "the image could not be read ".repeat(2))).collect();
+    let notes: Vec<String> =
+        (1..=100).map(|i| format!("queue file {i:03}.png: reason {i:03} — {}", "the image could not be read ".repeat(2))).collect();
     let message = format!("Skipped 100 files: {}", notes[0]);
     crate::io::show_with_notes(&mut shown.app(), message.clone(), notes.clone());
-    let original = { let app = shown.app(); (app.ui.status.clone(), app.ui.status_notes.clone(), app.ui.status_sets) };
+    let original = {
+        let app = shown.app();
+        (app.ui.status.clone(), app.ui.status_notes.clone(), app.ui.status_sets)
+    };
     shown.settle();
-    let link = shown.fixture.by_role(Role::LINK).into_iter().find(|target| shown.tree().name_of(target.node) == Some(message.as_str())).expect("the message is the current framework's keyboard-accessible link");
+    let link = shown
+        .fixture
+        .by_role(Role::LINK)
+        .into_iter()
+        .find(|target| shown.tree().name_of(target.node) == Some(message.as_str()))
+        .expect("the message is the current framework's keyboard-accessible link");
     shown.click_on(&link);
     let expected = format!("{message}\n{}", notes.iter().map(|n| format!("• {n}")).collect::<Vec<_>>().join("\n"));
     review_status_details_scroll_to_tail(&mut shown, &expected, &notes[99]);
-    { let app = shown.app(); assert_eq!((app.ui.status.clone(), app.ui.status_notes.clone(), app.ui.status_sets), original, "viewing and scrolling do not repeat or alter the report"); }
+    {
+        let app = shown.app();
+        assert_eq!(
+            (app.ui.status.clone(), app.ui.status_notes.clone(), app.ui.status_sets),
+            original,
+            "viewing and scrolling do not repeat or alter the report"
+        );
+    }
     shown.key(egui::Key::Escape);
     review_status_details_frame(&mut shown, vec![]);
-    assert!(shown.app().dialogs().unwrap().with(|h| !h.open_dialogs().iter().any(|d| d.key.as_deref() == Some(crate::dialogs::confirm::MESSAGE))), "Escape closes the full viewer");
+    assert!(
+        shown.app().dialogs().unwrap().with(|h| !h.open_dialogs().iter().any(|d| d.key.as_deref() == Some(crate::dialogs::confirm::MESSAGE))),
+        "Escape closes the full viewer"
+    );
     // Keyboard activation reaches the same complete content after closing it.
     shown.settle();
     let link = shown.named(&message);
@@ -3327,7 +3356,9 @@ fn review_4635935484_all_status_notes_are_reachable_by_click_and_wheel() {
 #[test]
 fn review_all_skipped_queue_error_scrolls_its_last_filename_and_reason_into_view() {
     let mut shown = review_status_details_shown();
-    let files: Vec<serde_json::Value> = (1..=100).map(|i| json!({"name": format!("all-skipped-{i:03}.png"), "dataBase64": vectorcraft_format::base64_encode(b"not a PNG")})).collect();
+    let files: Vec<serde_json::Value> = (1..=100)
+        .map(|i| json!({"name": format!("all-skipped-{i:03}.png"), "dataBase64": vectorcraft_format::base64_encode(b"not a PNG")}))
+        .collect();
     let (error, before, history) = {
         let mut app = shown.app();
         let before = app.session.doc().unwrap().doc.clone();
@@ -3342,7 +3373,10 @@ fn review_all_skipped_queue_error_scrolls_its_last_filename_and_reason_into_view
     let last = error.rfind("all-skipped-100.png").expect("the producer error retains the last filename");
     let tail = &error[last..];
     assert!(tail.len() > "all-skipped-100.png".len(), "the filename carries its actual rejection reason");
-    let original = { let app = shown.app(); (app.ui.status.clone(), app.ui.status_sets) };
+    let original = {
+        let app = shown.app();
+        (app.ui.status.clone(), app.ui.status_sets)
+    };
     shown.settle();
     assert!(shown.fixture.texts().iter().any(|t| t.text == error && t.elided), "the bounded message field elides the real error");
     shown.click(&error);

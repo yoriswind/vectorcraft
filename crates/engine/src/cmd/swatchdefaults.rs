@@ -323,14 +323,17 @@ fn refresh_references(d: &mut Document, palette: &Palette) -> Result<()> {
     }
     let cms = cms::active();
     let intent = cms.settings().intent;
-    let alternates: BTreeMap<String, [f32; 4]> = colors.iter().filter_map(|(name, base)| {
-        // Use the canonical separator to identify actual spot links (including the special case
-        // of a spot named Cyan/Magenta/Yellow/Black); a process or shadowed swatch is not a spot.
-        let ink = vectorcraft_doc::inks::stop_inks(d, &cms, base, Some((name, 1.0)), None, intent);
-        ink.spot.as_ref()?;
-        let equivalent = if cms::PROCESS_PLATES.contains(&name.as_str()) { ink.cmyk } else { cms.to_cmyk(base, intent) };
-        Some((name.clone(), equivalent))
-    }).collect();
+    let alternates: BTreeMap<String, [f32; 4]> = colors
+        .iter()
+        .filter_map(|(name, base)| {
+            // Use the canonical separator to identify actual spot links (including the special case
+            // of a spot named Cyan/Magenta/Yellow/Black); a process or shadowed swatch is not a spot.
+            let ink = vectorcraft_doc::inks::stop_inks(d, &cms, base, Some((name, 1.0)), None, intent);
+            ink.spot.as_ref()?;
+            let equivalent = if cms::PROCESS_PLATES.contains(&name.as_str()) { ink.cmyk } else { cms.to_cmyk(base, intent) };
+            Some((name.clone(), equivalent))
+        })
+        .collect();
     let mut color_link = |color: &mut Color, link: &mut Option<String>, tint: &mut f32| {
         let Some(name) = link.as_deref() else { return false };
         match colors.get(name) {
@@ -532,7 +535,8 @@ mod tests {
         d.swatches = vec![
             Swatch { name: "Brand".into(), paint: Paint::solid(base), global: true, spot: true },
             Swatch { name: "Brand ramp".into(), paint: palette_paint, global: false, spot: false },
-        ].into();
+        ]
+        .into();
         let mut resource = GradientPaint::new(gradient);
         resource.swatch = Some("Brand ramp".into());
         let resource = Paint::Gradient(Box::new(resource));
@@ -552,11 +556,17 @@ mod tests {
         assert_eq!(ink.spot, Some(("Brand".into(), tint)), "refresh preserves the spot plate and its tint");
         // Independent existing separated-image compositor: the same physical plate mix, quantized to one pixel.
         let equivalent = c.to_cmyk(&base, c.settings().intent);
-        let separated = Separated::new(1, 1, vec![
-            InkPlate { name: "Cyan".into(), cmyk: [1.0, 0.0, 0.0, 0.0], data: vec![51] },
-            InkPlate { name: "Yellow".into(), cmyk: [0.0, 0.0, 1.0, 0.0], data: vec![102] },
-            InkPlate { name: "Brand".into(), cmyk: equivalent, data: vec![128] },
-        ]).unwrap().composite();
+        let separated = Separated::new(
+            1,
+            1,
+            vec![
+                InkPlate { name: "Cyan".into(), cmyk: [1.0, 0.0, 0.0, 0.0], data: vec![51] },
+                InkPlate { name: "Yellow".into(), cmyk: [0.0, 0.0, 1.0, 0.0], data: vec![102] },
+                InkPlate { name: "Brand".into(), cmyk: equivalent, data: vec![128] },
+            ],
+        )
+        .unwrap()
+        .composite();
         let Color::Cmyk { c, m, y, k } = refreshed.color else { panic!("mixed CMYK display cache") };
         for (channel, byte) in [c, m, y, k].into_iter().zip(&separated.data) {
             assert!((channel - f32::from(*byte) / 255.0).abs() <= 0.5 / 255.0 + 1e-6, "display uses the canonical ink composition");
@@ -576,5 +586,4 @@ mod tests {
         refresh_references(&mut d, &palette).unwrap();
         assert_eq!(d, before, "refresh is idempotent and does not modify authoritative plate/link data");
     }
-
 }
