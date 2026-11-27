@@ -26,9 +26,15 @@ pub fn open_bytes(app: &mut VectorcraftApp, name: &str, bytes: &[u8], path: Opti
 /// [`open_bytes`], a document opening with `document.open`'s params `p`.
 fn open_bytes_with(app: &mut VectorcraftApp, name: &str, bytes: &[u8], path: Option<String>, p: &Value) -> Result<Value, String> {
     let opens = opens_as(name);
-    // A WebAssembly plug-in is installed.
+    // A plug-in is installed: a JavaScript plug-in's manifest by its path, which the script it
+    // names is read beside. Without a path the manifest's bytes alone are refused, since they hold
+    // no script (`vectorcraft_plugins::js::SOURCE_RULE`).
     if opens == Some(OpensAs::Plugin) {
-        let module = json!({"dataBase64": vectorcraft_format::base64_encode(bytes), "name": path.as_deref().unwrap_or(name)});
+        let js = vectorcraft_plugins::registry::is_js_package(std::path::Path::new(name));
+        let module = match path.as_deref() {
+            Some(path) if js => json!({ "path": path }),
+            _ => json!({"dataBase64": vectorcraft_format::base64_encode(bytes), "name": path.as_deref().unwrap_or(name)}),
+        };
         return install_module(app, module).map(|_| Value::Null);
     }
     if opens == Some(OpensAs::ShortcutSet) {
@@ -609,6 +615,12 @@ fn open_file_with(app: &mut VectorcraftApp, path: &str, background: bool, p: &Va
         note_recent(app, path);
         return Ok(Value::Null);
     }
+    // A JavaScript plug-in's manifest is read by `plugin.install {path}`, with the script it names.
+    if opens_as(path) == Some(OpensAs::Plugin) && vectorcraft_plugins::registry::is_js_package(std::path::Path::new(path)) {
+        install_module(app, json!({ "path": path }))?;
+        note_recent(app, path);
+        return Ok(Value::Null);
+    }
     // A file only an importer plug-in reads is not read past the importer's input limit.
     check_import_size(path, false)?;
     let bytes = read(app, path)?;
@@ -677,7 +689,13 @@ pub fn ask_revert(app: &mut VectorcraftApp) -> Result<Value, String> {
     (c.enabled)(&app.session)?;
     let name = app.session.active().map(|d| d.title()).unwrap_or_default();
     let message = crate::i18n::fmt(tl!("Revert to the saved version of “{name}”?"), &[("name", &name)]);
-    dialogs::confirm::ask(app, &message, tl!("Changes made since it was last saved will be lost."), "file.revert", json!({ "confirmed": true }));
+    dialogs::confirm::ask_in_document(
+        app,
+        &message,
+        tl!("Changes made since it was last saved will be lost."),
+        "file.revert",
+        json!({ "confirmed": true }),
+    );
     Ok(json!({ "pending": dialogs::confirm::KIND }))
 }
 
