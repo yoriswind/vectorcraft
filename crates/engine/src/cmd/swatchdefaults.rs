@@ -461,7 +461,7 @@ mod tests {
         image::DynamicImage::ImageRgba8(pixels).write_to(&mut out, image::ImageFormat::Png).unwrap();
         let bytes = out.into_inner();
         let mut d = Document::new(1.0, 1.0);
-        d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(bytes), proxy: None });
+        d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(bytes), proxy: None, file_font: Default::default() });
         let image = Node::new(
             d.alloc_id(),
             NodeKind::Image(Box::new(ImageObject {

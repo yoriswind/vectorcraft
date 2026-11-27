@@ -170,7 +170,7 @@ fn resource_palette(missing_link: &Path) -> (Document, Vec<u8>) {
     d.color_profiles.rgb = Some(cms::WIDE_GAMUT_RGB.into());
     d.color_profiles.cmyk = Some(cms::GENERIC_CMYK.into());
     let bytes = png([17, 85, 153, 255]);
-    d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(bytes.clone()), proxy: None });
+    d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(bytes.clone()), proxy: None, file_font: Default::default() });
     let image = image_node(&mut d, Some(LinkInfo::new(missing_link.to_string_lossy().to_string())));
     vectorcraft_brush::store(
         &mut d,
@@ -224,7 +224,7 @@ fn customized_profile() -> Document {
     d.symbols.push(Symbol { name: "Profile removed".into(), art: Arc::new(removed), dynamic: false });
     let badge = rectangle(&mut d, Paint::solid(Color::rgb8(255, 0, 0)));
     d.symbols.push(Symbol { name: "Badge".into(), art: Arc::new(badge), dynamic: false });
-    d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(png([255, 0, 0, 255])), proxy: None });
+    d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(png([255, 0, 0, 255])), proxy: None, file_font: Default::default() });
     let image = image_node(&mut d, None);
     d.patterns.push(PatternDef::new("Dots", vec![Arc::new(image)]));
     let brush_art = rectangle(&mut d, Paint::solid(Color::rgb8(255, 0, 0)));
@@ -731,7 +731,7 @@ fn default_swatches_pattern_composite_family_survives_restart_and_profile_collis
     let saved = source.prefs.to_json();
     let mut bad = (*original).clone();
     let bytes = Arc::new(png([19, 47, 83, 255]));
-    let preview = ImageBlob { mime: "image/png".into(), bytes: bytes.clone(), proxy: Some(bytes) };
+    let preview = ImageBlob { mime: "image/png".into(), bytes: bytes.clone(), proxy: Some(bytes), file_font: Default::default() };
     assert!(preview.is_proxy(), "the missing linked image has only its saved preview");
     bad.images.insert("pixels".into(), preview);
     let image = image_node(&mut bad, Some(LinkInfo::new(dir.0.join("missing-composite-brush-image.png").to_string_lossy().to_string())));
@@ -1131,7 +1131,7 @@ fn review_resource_failed_native_capture(source: &Session, original: &Document, 
     // document whose expansion introduces an alias in the private session.
     let mut bad = (*original).clone();
     let bytes = Arc::new(png([19, 47, 83, 255]));
-    bad.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: bytes.clone(), proxy: Some(bytes) });
+    bad.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: bytes.clone(), proxy: Some(bytes), file_font: Default::default() });
     let image = image_node(&mut bad, Some(LinkInfo::new(directory.join("missing-native-family-brush.png").to_string_lossy().to_string())));
     vectorcraft_brush::store(
         &mut bad,
@@ -1879,7 +1879,7 @@ fn review_598379_image_palette() -> Document {
     assert!(bytes.len() < 1024 * 1024, "CONTROL: decoded image bytes are below the preference budget");
     assert!(vectorcraft_format::base64_encode(&bytes).len() > 1024 * 1024, "CONTROL: encoding this image alone crosses the budget");
     let mut d = raw_palette();
-    d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(bytes), proxy: None });
+    d.images.insert("pixels".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(bytes), proxy: None, file_font: Default::default() });
     let mut image = image_node(&mut d, None);
     let NodeKind::Image(im) = &mut image.kind else { panic!("image fixture") };
     im.width = 448;
