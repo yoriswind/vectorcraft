@@ -97,6 +97,7 @@ mod style;
 pub use style::styled_node;
 pub mod stylelib;
 mod svgfilter;
+pub use svgfilter::MAX_IMPORT_BYTES as MAX_SVG_FILTER_IMPORT_BYTES;
 mod swatch;
 mod swatchdefaults;
 pub mod swatchlib;
