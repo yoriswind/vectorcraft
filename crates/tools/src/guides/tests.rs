@@ -2962,3 +2962,86 @@ fn review_7909_copy_later_regression(d: &Document, owner: NodeId, left: NodeId) 
         review_7909_copy_excluded(&later, &[left], edge);
     }
 }
+
+fn review_7909_free_move(on: bool, show: bool, edge: f64, ruler: Option<f64>, x_axis: bool, orthogonal: bool) -> (Point, Vec<Overlay>) {
+    // Original synthetic bands and one moving rectangle, transposed to exercise both axes.
+    let orient = |p: Point| if x_axis { p } else { Point::new(p.y, p.x) };
+    let mut d = Document::new(800.0, 600.0);
+    let band = if orthogonal {
+        [Point::new(-1000.0, edge + 10.0), Point::new(2000.0, edge + 10.0)]
+    } else {
+        [Point::new(edge + 10.0, -1000.0), Point::new(edge + 10.0, 2000.0)]
+    };
+    review_597185_path(&mut d, &band.map(orient), Some(20.0));
+    if let Some(pos) = ruler {
+        d.add_ruler_guide(&vectorcraft_doc::Guide::new(x_axis, pos));
+    }
+    let moving = d.alloc_id();
+    let bounds = if x_axis { Rect::new(50.0, 150.0, 70.0, 170.0) } else { Rect::new(150.0, 50.0, 170.0, 70.0) };
+    d.insert(Some(d.layers[0].id), usize::MAX, Node::path(moving, vectorcraft_geom::shapes::rectangle(bounds), vectorcraft_doc::Appearance::default())).unwrap();
+    let mut selection = Selection::default();
+    selection.set([moving]);
+    let paint = paint();
+    let c = ToolContext {
+        smart_guides: true,
+        guides: true,
+        snap_to_point: true,
+        snap_to_grid: false,
+        snap_to_pixel: false,
+        snap_to_glyph: false,
+        snap_to_last_location: false,
+        spacing_guides: false,
+        snap_to_stroke_edges: on,
+        snapping_tolerance: 4.0,
+        alignment_guides: show,
+        anchor_path_labels: show,
+        ..cx(&d, &selection, &paint)
+    };
+    let (start, raw) = (orient(Point::new(60.0, 150.0)), orient(Point::new(190.0, 150.0)));
+    let targets = Targets::for_move(&c, &selection.objects);
+    assert!(targets.stroke_contours.nearest(raw, 4.0).is_none(), "CONTROL: paint can contact only the moving bounds, not the grabbed point");
+    let before = d.clone();
+    let mut snap = crate::select::MoveSnap::new(&c);
+    let (delta, guides) = snap.snap(&c, start, raw - start, false);
+    assert_eq!(d, before, "candidate selection cannot edit the target or moving document");
+    (start + delta, guides)
+}
+
+#[test]
+fn review_7909_free_bounds_keep_nearer_rulers_and_compatible_paint() {
+    for x_axis in [true, false] {
+        let point = |along, across| if x_axis { Point::new(along, across) } else { Point::new(across, along) };
+        for show in [true, false] {
+            let paint_only = review_7909_free_move(true, show, 203.0, None, x_axis, false);
+            assert_eq!(paint_only.0, point(193.0, 150.0), "CONTROL: the actual painted edge requires three points of travel");
+            assert_eq!(review_597185_stroke_label(&paint_only.1), show);
+            let ordinary = review_7909_free_move(false, show, 203.0, Some(201.0), x_axis, false);
+            assert_eq!(ordinary.0, point(191.0, 150.0), "CONTROL: OFF keeps the ordinary bounds-only ruler one point away");
+            assert!(!review_597185_stroke_label(&ordinary.1));
+            let nearer_ruler = review_7909_free_move(true, show, 203.0, Some(201.0), x_axis, false);
+            assert_eq!(nearer_ruler.0, ordinary.0, "REGRESSION5994032586: one-point bounds ruler must survive the saved three-point paint candidate");
+            assert!(!review_597185_stroke_label(&nearer_ruler.1), "a rejected paint candidate leaves no false stroke label");
+            let nearer_paint = review_7909_free_move(true, show, 201.0, Some(203.0), x_axis, false);
+            assert_eq!(nearer_paint.0, point(191.0, 150.0), "CONTROL: a real one-point painted contact beats the three-point bounds ruler");
+            assert_eq!(review_597185_stroke_label(&nearer_paint.1), show);
+            let zero_bounds = review_7909_free_move(true, show, 203.0, Some(200.0), x_axis, false);
+            assert_eq!(zero_bounds.0, point(190.0, 150.0), "zero-travel bounds contact is still a nearer actual ruler contact");
+            assert!(!review_597185_stroke_label(&zero_bounds.1));
+            let held = review_7909_free_move(true, show, 201.0, Some(193.0), x_axis, false);
+            assert_eq!(held.0, point(193.0, 150.0), "CONTROL: the truly grabbed point retains priority over closer bounds paint");
+            assert!(!review_597185_stroke_label(&held.1));
+            let zero_held = review_7909_free_move(true, show, 203.0, Some(190.0), x_axis, false);
+            assert_eq!(zero_held.0, point(190.0, 150.0), "CONTROL: exact grabbed-point ruler contact also retains priority");
+            let orthogonal = review_7909_free_move(true, show, 173.0, Some(201.0), x_axis, true);
+            assert_eq!(orthogonal.0, point(191.0, 153.0), "a ruler on one axis and real paint on the other both remain satisfied");
+            assert_eq!(review_597185_stroke_label(&orthogonal.1), show);
+            if show {
+                assert!(orthogonal.1.iter().any(|g| matches!(g, Overlay::Line { a, b, .. } if if x_axis { a.x == 201.0 && b.x == 201.0 } else { a.y == 201.0 && b.y == 201.0 })), "the retained ruler still has its actual line");
+            } else {
+                for guides in [&nearer_ruler.1, &nearer_paint.1, &zero_bounds.1, &held.1, &zero_held.1, &orthogonal.1] {
+                    assert!(guides.is_empty(), "display switches do not change candidate priority or leak guides");
+                }
+            }
+        }
+    }
+}

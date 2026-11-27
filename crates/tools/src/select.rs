@@ -377,7 +377,7 @@ impl MoveSnap {
             } else {
                 let (adj, ov, axes, contact) = t.snap_rects_axes_contact(&[b + d], cx.snap_tol());
                 let (adj, ov, axes) = if contact {
-                    bounds_contour = Some((d + adj, ov));
+                    bounds_contour = Some((d + adj, ov, d));
                     t.snap_rects_axes_legacy(&[b + d], cx.snap_tol())
                 } else {
                     (adj, ov, axes)
@@ -391,10 +391,12 @@ impl MoveSnap {
         // axis without one that Smart Guides left free, the bounds line up with the ruler guides
         // (#5746), alongside the Smart Guides.
         let mut held_by_ruler = false;
+        let mut ruler_axes = [false; 2];
         if let Some(t) = self.rulers.as_ref().filter(|_| !on_path) {
-            let (adj, ov, held) = t.snap_moved_to_rulers(start + d, self.bounds.map(|b| b + d), cx.snap_tol(), taken);
+            let (adj, ov, held, axes) = t.snap_moved_to_rulers(start + d, self.bounds.map(|b| b + d), cx.snap_tol(), taken);
             held_by_ruler = held;
-            if adj != Vec2::ZERO {
+            ruler_axes = axes;
+            if adj != Vec2::ZERO || (bounds_contour.is_some() && axes.contains(&true)) {
                 d += adj;
                 if held {
                     guides = ov;
@@ -403,9 +405,34 @@ impl MoveSnap {
                 }
             }
         }
-        if !held_by_ruler && let Some((painted, overlays)) = bounds_contour {
-            d = painted;
-            guides = overlays;
+        if !held_by_ruler && let Some((painted, overlays, raw)) = bounds_contour {
+            let paint_pull = painted - raw;
+            let ordinary_pull = d - raw;
+            // Compare actual ruler contacts, not the legacy box alignment that paint replaces.
+            // A zero component of a nonzero paint pull leaves that axis free for a ruler.
+            let keep = [
+                ruler_axes[0] && ((paint_pull.x == 0.0 && paint_pull != Vec2::ZERO) || ordinary_pull.x.abs() < paint_pull.x.abs()),
+                ruler_axes[1] && ((paint_pull.y == 0.0 && paint_pull != Vec2::ZERO) || ordinary_pull.y.abs() < paint_pull.y.abs()),
+            ];
+            if !keep.contains(&true) {
+                d = painted;
+                guides = overlays;
+            } else if keep[0] != keep[1] && let (Some(t), Some(b)) = (targets, self.bounds) {
+                // Keep the winning ruler axis, then find a real paint contact along the other.
+                // Splicing components of the original diagonal contact could invent a contact.
+                let (pinned, axis) = if keep[0] { (Vec2::new(d.x, raw.y), Vec2::new(0.0, 1.0)) } else { (Vec2::new(raw.x, d.y), Vec2::new(1.0, 0.0)) };
+                let (adj, ov, paint_hit) = t.snap_rects_along_contact(&[b + pinned], axis, cx.snap_tol());
+                let candidate = pinned + adj;
+                let free = if keep[0] { 1 } else { 0 };
+                let (paint_travel, ruler_travel) = if keep[0] { (candidate.y - raw.y, ordinary_pull.y) } else { (candidate.x - raw.x, ordinary_pull.x) };
+                if paint_hit && (!ruler_axes[free] || paint_travel.abs() <= ruler_travel.abs()) {
+                    d = candidate;
+                    // The other axis no longer has its old alignment; keep only the retained
+                    // axis's lines and the actual new painted contact's label.
+                    guides.retain(|g| matches!(g, Overlay::Line { a, b, .. } if if keep[0] { a.x == b.x } else { a.y == b.y }));
+                    guides.extend(ov);
+                }
+            }
         }
         if cx.snaps_to_pixel(PixelOp::Moving)
             && let Some(b) = self.bounds

@@ -1736,9 +1736,9 @@ impl Targets {
     /// guides: the grabbed point goes into line with a guide running within `tol` of it
     /// ([`Self::snap_point`]), and on an axis where none does and that is not `taken` (x, y)
     /// already, the edge or centre of `r` nearest a guide running past it within `tol` goes onto it
-    /// (#5746). Returns the shift, the guides (none when nothing lines up) and whether a guide held
-    /// the grabbed point.
-    pub(crate) fn snap_moved_to_rulers(&self, p: Point, r: Option<Rect>, tol: f64, taken: [bool; 2]) -> (Vec2, Vec<Overlay>, bool) {
+    /// (#5746). Returns the shift, the guides (none when nothing lines up), whether a guide held
+    /// the grabbed point, and the contacted axes (including zero-travel bounds contacts).
+    pub(crate) fn snap_moved_to_rulers(&self, p: Point, r: Option<Rect>, tol: f64, taken: [bool; 2]) -> (Vec2, Vec<Overlay>, bool, [bool; 2]) {
         let near = |vertical: bool| {
             let v = if vertical { p.x } else { p.y };
             self.rulers.iter().any(|g| g.vertical == vertical && (g.pos - v).abs() <= tol && g.line_at(p, tol).is_some())
@@ -1746,7 +1746,7 @@ impl Targets {
         let held = [near(true), near(false)];
         let (q, mut ov) = if held.contains(&true) { self.snap_point(p, tol) } else { (p, vec![]) };
         let mut d = q - p;
-        let Some(r) = r.map(|r| r + d) else { return (d, ov, held.contains(&true)) };
+        let Some(r) = r.map(|r| r + d) else { return (d, ov, held.contains(&true), held) };
         // The guide upright (`vertical`) or level nearest one of `vs`, running past `r` across.
         let nearest = |vertical: bool, vs: [f64; 3]| {
             let (c, half) =
@@ -1773,7 +1773,7 @@ impl Targets {
         if lined && !held.contains(&true) {
             ov.extend(self.label(p + d, "align"));
         }
-        (d, ov, held.contains(&true))
+        (d, ov, held.contains(&true), [held[0] || hx.is_some(), held[1] || hy.is_some()])
     }
 
     /// [`Self::snap_moved_to_rulers`] for a selection a move Shift keeps to its line (through the
